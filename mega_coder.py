@@ -2,6 +2,7 @@
 
 import ast
 import os
+import random
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -21,6 +22,11 @@ MODEL = "gpt-5-nano"
 OUTPUT_FILE = Path(__file__).with_name("generated-code-openai.py")
 RUN_TIMEOUT_SECONDS = 30
 MAX_REPAIR_ATTEMPTS = 5
+
+# Educational repair-loop test. Keep disabled to avoid unexpected paid repairs.
+ENABLE_FAULT_INJECTION = False
+FAULT_INJECTION_PROBABILITY = 0.25
+INJECTED_FAILURE = 'raise RuntimeError("Deliberately injected test failure")'
 
 FORBIDDEN_MODULES = {
     "aiohttp",
@@ -282,6 +288,33 @@ def validate_generated_code(code):
         )
 
 
+def corrupt_generated_code(
+    code,
+    enabled=None,
+    probability=None,
+    random_number_function=None,
+):
+    """Optionally append one controlled failure for repair-loop testing."""
+    if enabled is None:
+        enabled = ENABLE_FAULT_INJECTION
+    if probability is None:
+        probability = FAULT_INJECTION_PROBABILITY
+
+    if not isinstance(probability, (int, float)) or not 0.0 <= probability <= 1.0:
+        raise ValueError("Fault injection probability must be between 0.0 and 1.0.")
+
+    if not enabled:
+        return code, False
+
+    if random_number_function is None:
+        random_number_function = random.random
+    if random_number_function() >= probability:
+        return code, False
+
+    corrupted_code = f"{code.rstrip()}\n\n{INJECTED_FAILURE}\n"
+    return corrupted_code, True
+
+
 def write_generated_code(code, file_path=OUTPUT_FILE):
     """Overwrite the generated Python file using UTF-8."""
     Path(file_path).write_text(code, encoding="utf-8")
@@ -513,6 +546,25 @@ def develop_program():
         validate_generated_code(generated_code)
     except GeneratedCodeValidationError as error:
         print(f"Generated code failed validation: {error}")
+        repair_generated_program(
+            program_description,
+            generated_code,
+            format_validation_failure(error),
+            OUTPUT_FILE,
+        )
+        return
+
+    generated_code, fault_was_injected = corrupt_generated_code(generated_code)
+    if fault_was_injected:
+        print(
+            "Testing repair behavior: a deliberate error was added to the "
+            "generated program. Repair API calls may incur usage charges."
+        )
+
+    try:
+        validate_generated_code(generated_code)
+    except GeneratedCodeValidationError as error:
+        print(f"Fault-injected code failed validation: {error}")
         repair_generated_program(
             program_description,
             generated_code,
