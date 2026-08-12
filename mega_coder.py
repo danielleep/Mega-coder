@@ -1,5 +1,8 @@
 """Mega Coder console application."""
 
+# Milestones 1-8 intentionally remain together in one beginner-friendly module.
+# pylint: disable=too-many-lines
+
 import ast
 import os
 import random
@@ -14,7 +17,9 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+from colorama import Fore, Style, just_fix_windows_console
 from openai import OpenAI, OpenAIError
+from tqdm import tqdm
 
 ENV_FILE = Path(__file__).resolve().with_name(".env")
 load_dotenv(dotenv_path=ENV_FILE, override=False)
@@ -119,6 +124,30 @@ class PylintResult:
     operational_error: str = ""
 
 
+def _print_colored(message, color):
+    """Print a colored status in terminals and plain text when redirected."""
+    if sys.stdout.isatty():
+        print(f"{color}{message}{Style.RESET_ALL}")
+    else:
+        print(message)
+
+
+def _progress_bar(steps=None, *, total=None, description, unit):
+    """Create a concise progress bar that stays quiet when redirected."""
+    return tqdm(steps, total=total, desc=description, unit=unit, leave=False,
+                disable=not sys.stderr.isatty())
+
+
+def _call_openai_with_progress(prompt):
+    """Make the single optimization request with one non-nested progress bar."""
+    with _progress_bar(
+        total=1, description="Requesting optimization", unit="request",
+    ) as progress:
+        model_output = call_openai(prompt)
+        progress.update(1)
+    return model_output
+
+
 def show_menu():
     """Display the Mega Coder menu."""
     print(MENU)
@@ -132,7 +161,10 @@ def ask_for_program_description():
         description = input().strip()
         if description:
             return description
-        print("The program description cannot be empty. Please try again.")
+        _print_colored(
+            "The program description cannot be empty. Please try again.",
+            Fore.YELLOW,
+        )
 
 
 def build_generation_prompt(program_description):
@@ -459,16 +491,20 @@ def report_execution_result(result, timeout=RUN_TIMEOUT_SECONDS):
     _print_captured_output("Generated program output:", result.stdout)
 
     if result.success:
-        print("Generated program and its assertions completed successfully.")
+        _print_colored(
+            "Generated program and its assertions completed successfully.",
+            Fore.GREEN,
+        )
         return
 
     if result.timed_out:
-        print(f"Generated program failed: execution exceeded {timeout} seconds.")
+        message = f"Generated program failed: execution exceeded {timeout} seconds."
     elif result.returncode is not None:
-        print(f"Generated program failed with return code {result.returncode}.")
+        message = f"Generated program failed with return code {result.returncode}."
     else:
-        print("Generated program could not be started.")
+        message = "Generated program could not be started."
 
+    _print_colored(message, Fore.RED)
     _print_captured_output("Generated program errors:", result.stderr)
 
 
@@ -645,9 +681,15 @@ def _request_lint_candidate(prompt):
     try:
         return call_openai(prompt)
     except OpenAIError:
-        print("The OpenAI lint-repair request failed. The working version was kept.")
+        _print_colored(
+            "The OpenAI lint-repair request failed. The working version was kept.",
+            Fore.RED,
+        )
     except ValueError:
-        print("Could not request a lint repair. Check the OpenAI API settings.")
+        _print_colored(
+            "Could not request a lint repair. Check the OpenAI API settings.",
+            Fore.RED,
+        )
     return None
 
 
@@ -659,13 +701,16 @@ def _evaluate_lint_candidate(model_output, current_code, current_pylint,
         execution_result, candidate_pylint = _test_lint_candidate(
             candidate_code, expected_stdout, output_path)
     except (GeneratedCodeValidationError, SyntaxError, ValueError) as error:
-        print(f"The lint candidate was rejected: {error}")
+        _print_colored(f"The lint candidate was rejected: {error}", Fore.YELLOW)
         return None, None, False
     except OSError as error:
-        print(f"The lint candidate could not be tested: {error}")
+        _print_colored(f"The lint candidate could not be tested: {error}", Fore.RED)
         return None, None, False
     if candidate_pylint is not None and not candidate_pylint.command_succeeded:
-        print(f"Pylint could not complete its check: {candidate_pylint.operational_error}")
+        _print_colored(
+            f"Pylint could not complete its check: {candidate_pylint.operational_error}",
+            Fore.RED,
+        )
         return None, None, True
     rejection = ""
     if not execution_result.success or execution_result.stderr:
@@ -675,7 +720,8 @@ def _evaluate_lint_candidate(model_output, current_code, current_pylint,
     elif candidate_pylint.issue_count >= current_pylint.issue_count:
         rejection = "The lint candidate did not reduce the Pylint diagnostics."
     if rejection:
-        print(f"{rejection} The current working version was kept.")
+        _print_colored(
+            f"{rejection} The current working version was kept.", Fore.YELLOW)
         return None, None, False
     return candidate_code, candidate_pylint, False
 
@@ -688,13 +734,19 @@ def check_and_repair_lint(
     current_code = working_code
     current_pylint = run_pylint(output_path)
     if not current_pylint.command_succeeded:
-        print(f"Pylint could not complete its check: {current_pylint.operational_error}")
+        _print_colored(
+            f"Pylint could not complete its check: {current_pylint.operational_error}",
+            Fore.RED,
+        )
         return False
     if current_pylint.issue_count == 0:
-        print("Amazing. No lint errors/warnings")
+        _print_colored("Amazing. No lint errors/warnings", Fore.GREEN)
         return True
-    print("Lint repair API requests may incur usage charges.")
-    for attempt_number in range(1, MAX_LINT_REPAIR_ATTEMPTS + 1):
+    _print_colored("Lint repair API requests may incur usage charges.", Fore.YELLOW)
+    lint_attempts = _progress_bar(
+        range(1, MAX_LINT_REPAIR_ATTEMPTS + 1),
+        description="Repairing Pylint diagnostics", unit="attempt")
+    for attempt_number in lint_attempts:
         print(f"Lint repair attempt {attempt_number} of {MAX_LINT_REPAIR_ATTEMPTS}...")
         prompt = build_lint_repair_prompt(
             program_description, current_code, current_pylint, attempt_number,
@@ -712,15 +764,16 @@ def check_and_repair_lint(
         try:
             write_generated_code(candidate_code, output_path)
         except OSError as error:
-            print(f"Could not save the improved lint version: {error}")
+            _print_colored(
+                f"Could not save the improved lint version: {error}", Fore.RED)
             return False
         current_code = candidate_code
         current_pylint = candidate_pylint
         if current_pylint.issue_count == 0:
-            print("Amazing. No lint errors/warnings")
+            _print_colored("Amazing. No lint errors/warnings", Fore.GREEN)
             return True
     else:
-        print("There are still lint errors/warnings")
+        _print_colored("There are still lint errors/warnings", Fore.RED)
     return False
 
 
@@ -755,15 +808,16 @@ def optimize_generated_program(
     prompt = build_optimization_prompt(program_description, working_code)
 
     try:
-        model_output = call_openai(prompt)
+        model_output = _call_openai_with_progress(prompt)
     except (OpenAIError, ValueError) as error:
         if isinstance(error, OpenAIError):
-            print(
+            _print_colored(
                 "The OpenAI optimization request failed. "
-                "The previous working version was kept."
+                "The previous working version was kept.",
+                Fore.RED,
             )
         else:
-            print(f"Could not request optimization: {error}")
+            _print_colored(f"Could not request optimization: {error}", Fore.RED)
         return False
 
     try:
@@ -776,9 +830,10 @@ def optimize_generated_program(
                 "The optimized candidate changed the assertions."
             )
     except (GeneratedCodeValidationError, SyntaxError, ValueError) as error:
-        print(
+        _print_colored(
             "The optimized candidate was invalid, so the previous working "
-            f"version was kept: {error}"
+            f"version was kept: {error}",
+            Fore.YELLOW,
         )
         return False
 
@@ -792,9 +847,10 @@ def optimize_generated_program(
             write_generated_code(optimized_code, candidate_path)
             optimized_result = run_generated_program(candidate_path)
     except OSError as error:
-        print(
+        _print_colored(
             "The optimized candidate could not be tested, so the previous "
-            f"working version was kept: {error}"
+            f"working version was kept: {error}",
+            Fore.RED,
         )
         return False
 
@@ -803,19 +859,20 @@ def optimize_generated_program(
         working_result,
     )
     if rejection_reason:
-        print(rejection_reason)
+        _print_colored(rejection_reason, Fore.YELLOW)
         return False
 
     try:
         write_generated_code(optimized_code, output_path)
     except OSError as error:
-        print(f"Could not save the optimized program: {error}")
+        _print_colored(f"Could not save the optimized program: {error}", Fore.RED)
         return False
 
-    print(
+    _print_colored(
         "Code running time optimized! It now runs in "
         f"{optimized_result.duration_ms:.3f} milliseconds, while before it was "
-        f"{working_result.duration_ms:.3f} milliseconds"
+        f"{working_result.duration_ms:.3f} milliseconds",
+        Fore.GREEN,
     )
     return True
 
@@ -829,7 +886,8 @@ def finish_working_program(
     try:
         best_working_code = Path(output_file).read_text(encoding="utf-8")
     except OSError as error:
-        print(f"Could not read {Path(output_file).name} for Pylint: {error}")
+        _print_colored(
+            f"Could not read {Path(output_file).name} for Pylint: {error}", Fore.RED)
         return False
     return check_and_repair_lint(
         program_description, best_working_code, working_result, output_file)
@@ -842,7 +900,10 @@ def repair_generated_program(
     output_file=OUTPUT_FILE,
 ):
     """Request, validate, save, and run at most five repaired programs."""
-    for attempt_number in range(1, MAX_REPAIR_ATTEMPTS + 1):
+    repair_attempts = _progress_bar(
+        range(1, MAX_REPAIR_ATTEMPTS + 1),
+        description="Repairing generated program", unit="attempt")
+    for attempt_number in repair_attempts:
         print(f"Repair attempt {attempt_number} of {MAX_REPAIR_ATTEMPTS}...")
         prompt = build_repair_prompt(
             program_description,
@@ -854,13 +915,14 @@ def repair_generated_program(
         try:
             model_output = call_openai(prompt)
         except OpenAIError:
-            print(
+            _print_colored(
                 "The OpenAI repair request failed. "
-                "Check your connection and API settings."
+                "Check your connection and API settings.",
+                Fore.RED,
             )
             return False
         except ValueError as error:
-            print(f"Could not request a repair: {error}")
+            _print_colored(f"Could not request a repair: {error}", Fore.RED)
             return False
 
         try:
@@ -869,22 +931,25 @@ def repair_generated_program(
         except ValueError as error:
             current_code = model_output
             failure_details = format_validation_failure(error)
-            print(f"Repaired code failed validation: {error}")
+            _print_colored(f"Repaired code failed validation: {error}", Fore.YELLOW)
             continue
 
         try:
             write_generated_code(repaired_code, output_file)
         except OSError as error:
-            print(f"Could not write {Path(output_file).name}: {error}")
+            _print_colored(
+                f"Could not write {Path(output_file).name}: {error}", Fore.RED)
             return False
 
-        print(f"Repaired code saved to {Path(output_file).name}")
+        _print_colored(
+            f"Repaired code saved to {Path(output_file).name}", Fore.GREEN)
         print("Running the repaired program...")
         execution_result = run_generated_program(output_file)
         report_execution_result(execution_result)
 
         if execution_result.success:
-            print("Generated program repaired successfully.")
+            _print_colored("Generated program repaired successfully.", Fore.GREEN)
+            repair_attempts.close()
             finish_working_program(
                 program_description,
                 repaired_code,
@@ -896,7 +961,10 @@ def repair_generated_program(
         current_code = repaired_code
         failure_details = format_execution_failure(execution_result)
 
-    print("Sorry master, I have failed you. I can’t create this program without issues")
+    _print_colored(
+        "Sorry master, I have failed you. I can’t create this program without issues",
+        Fore.RED,
+    )
     return False
 
 
@@ -909,16 +977,19 @@ def develop_program():
         model_output = call_openai(prompt)
         generated_code = clean_generated_code(model_output)
     except OpenAIError:
-        print("The OpenAI request failed. Check your connection and API settings.")
+        _print_colored(
+            "The OpenAI request failed. Check your connection and API settings.",
+            Fore.RED,
+        )
         return
     except ValueError as error:
-        print(f"Could not generate code: {error}")
+        _print_colored(f"Could not generate code: {error}", Fore.RED)
         return
 
     try:
         validate_generated_code(generated_code)
     except GeneratedCodeValidationError as error:
-        print(f"Generated code failed validation: {error}")
+        _print_colored(f"Generated code failed validation: {error}", Fore.YELLOW)
         repair_generated_program(
             program_description,
             generated_code,
@@ -929,15 +1000,16 @@ def develop_program():
 
     generated_code, fault_was_injected = corrupt_generated_code(generated_code)
     if fault_was_injected:
-        print(
+        _print_colored(
             "Testing repair behavior: a deliberate error was added to the "
-            "generated program. Repair API calls may incur usage charges."
+            "generated program. Repair API calls may incur usage charges.",
+            Fore.YELLOW,
         )
 
     try:
         validate_generated_code(generated_code)
     except GeneratedCodeValidationError as error:
-        print(f"Fault-injected code failed validation: {error}")
+        _print_colored(f"Fault-injected code failed validation: {error}", Fore.YELLOW)
         repair_generated_program(
             program_description,
             generated_code,
@@ -949,10 +1021,10 @@ def develop_program():
     try:
         write_generated_code(generated_code, OUTPUT_FILE)
     except OSError as error:
-        print(f"Could not write {OUTPUT_FILE.name}: {error}")
+        _print_colored(f"Could not write {OUTPUT_FILE.name}: {error}", Fore.RED)
         return
 
-    print(f"Generated code saved to {OUTPUT_FILE.name}")
+    _print_colored(f"Generated code saved to {OUTPUT_FILE.name}", Fore.GREEN)
     print("Running the generated program...")
     execution_result = run_generated_program(OUTPUT_FILE)
     report_execution_result(execution_result)
@@ -975,6 +1047,7 @@ def develop_program():
 
 def main():
     """Run the Mega Coder menu."""
+    just_fix_windows_console()
     try:
         while True:
             show_menu()
@@ -985,9 +1058,9 @@ def main():
                 return
 
             if choice in {"2", "3"}:
-                print("Not implemented yet")
+                _print_colored("Not implemented yet", Fore.YELLOW)
             else:
-                print("Please choose 1, 2, or 3.")
+                _print_colored("Please choose 1, 2, or 3.", Fore.YELLOW)
     except (KeyboardInterrupt, EOFError):
         print("\nGoodbye.")
 

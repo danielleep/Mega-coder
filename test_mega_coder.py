@@ -928,5 +928,45 @@ class ExecutionTimingTests(unittest.TestCase):
         self.assertFalse(run_process.call_args.kwargs["shell"])
 
 
+class ConsolePresentationTests(unittest.TestCase):
+    """Verify Milestone 8 colors and concise progress indicators."""
+
+    def test_terminal_statuses_use_colors_and_reset_them(self):
+        """Success, failure, and warning text use the required colors."""
+        terminal = StringIO()
+        success = execution_result()
+        failure = execution_result(success=False, returncode=1)
+        with patch.object(terminal, "isatty", return_value=True):
+            with redirect_stdout(terminal):
+                mega_coder.report_execution_result(success)
+                mega_coder.report_execution_result(failure)
+                with patch("builtins.input", side_effect=["invalid", EOFError]):
+                    with patch("mega_coder.just_fix_windows_console"):
+                        mega_coder.main()
+
+        output = terminal.getvalue()
+        self.assertIn(mega_coder.Fore.GREEN, output)
+        self.assertIn(mega_coder.Fore.RED, output)
+        self.assertIn(mega_coder.Fore.YELLOW, output)
+        self.assertEqual(output.count(mega_coder.Style.RESET_ALL), 3)
+
+    def test_repair_progress_is_quiet_when_redirected(self):
+        """Repair progress uses tqdm without polluting redirected output."""
+        with patch("mega_coder.sys.stderr", StringIO()):
+            with patch("mega_coder.tqdm", return_value=range(1, 2)) as progress:
+                with patch(
+                    "mega_coder.call_openai",
+                    side_effect=mega_coder.OpenAIError("safe test failure"),
+                ):
+                    with redirect_stdout(StringIO()) as captured:
+                        mega_coder.repair_generated_program(
+                            DESCRIPTION, FAILURE_CODE, "failure"
+                        )
+
+        progress.assert_called_once()
+        self.assertTrue(progress.call_args.kwargs["disable"])
+        self.assertNotIn("Repairing generated program", captured.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
