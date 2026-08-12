@@ -8,8 +8,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from dotenv import load_dotenv
 
 from openai import OpenAI, OpenAIError
+
+ENV_FILE = Path(__file__).resolve().with_name(".env")
+load_dotenv(dotenv_path=ENV_FILE, override=False)
 
 
 MENU = """I’m Mega Coder. What would you like me to do today?

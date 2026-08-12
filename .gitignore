@@ -1,6 +1,10 @@
 .venv/
 .env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 .vscode/
 generated-code-openai.py
+.DS_Store
+.venv-old/

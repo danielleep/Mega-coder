@@ -2,3 +2,4 @@ openai
 colorama
 tqdm
 pylint
+python-dotenv
