@@ -27,6 +27,13 @@ OPTIMIZED_CODE = """def total(values):
 assert total([1, 2, 3]) == 6
 print("total:", total((1, 2, 3)))
 """
+LINT_CLEAN_CODE = '''def total(values):
+    """Return the sum of the supplied values."""
+    return sum(values)
+
+assert total([1, 2, 3]) == 6
+print("total:", total((1, 2, 3)))
+'''
 DESCRIPTION = "Create a deterministic calculator"
 WARNING_TEXT = "Testing repair behavior: a deliberate error was added"
 
@@ -43,6 +50,25 @@ def execution_result(**overrides):
     }
     values.update(overrides)
     return mega_coder.ExecutionResult(**values)
+
+
+def pylint_result(issue_count=0, **overrides):
+    """Create a deterministic Pylint result without running Pylint."""
+    diagnostics = "".join(
+        f"candidate.py:{index + 1}:0: C0114: Issue {index + 1} (test-issue)\n"
+        for index in range(issue_count)
+    )
+    values = {
+        "command_succeeded": True,
+        "returncode": 0 if issue_count == 0 else 16,
+        "stdout": diagnostics,
+        "stderr": "",
+        "timed_out": False,
+        "issue_count": issue_count,
+        "operational_error": "",
+    }
+    values.update(overrides)
+    return mega_coder.PylintResult(**values)
 
 
 class FaultInjectionTests(unittest.TestCase):
@@ -82,7 +108,7 @@ class FaultInjectionTests(unittest.TestCase):
             output_file = Path(temporary_directory) / "generated-code-openai.py"
             with patch("mega_coder.ENABLE_FAULT_INJECTION", False):
                 with patch("mega_coder.repair_generated_program") as repair:
-                    with patch("mega_coder.optimize_generated_program"):
+                    with patch("mega_coder.finish_working_program"):
                         api, output = self.run_develop(output_file, [SUCCESS_CODE])
 
         self.assertEqual(api.call_count, 1)
@@ -105,7 +131,7 @@ class FaultInjectionTests(unittest.TestCase):
             with patch("mega_coder.ENABLE_FAULT_INJECTION", True):
                 with patch("mega_coder.FAULT_INJECTION_PROBABILITY", 0.25):
                     with patch("mega_coder.random.random", return_value=0.25):
-                        with patch("mega_coder.optimize_generated_program"):
+                        with patch("mega_coder.finish_working_program"):
                             api, output = self.run_develop(
                                 output_file,
                                 [SUCCESS_CODE],
@@ -165,7 +191,7 @@ class FaultInjectionTests(unittest.TestCase):
                             "mega_coder.corrupt_generated_code",
                             wraps=mega_coder.corrupt_generated_code,
                         ) as corrupt:
-                            with patch("mega_coder.optimize_generated_program"):
+                            with patch("mega_coder.finish_working_program"):
                                 api, output = self.run_develop(
                                     output_file,
                                     [SUCCESS_CODE, SUCCESS_CODE],
@@ -197,7 +223,7 @@ class FaultInjectionTests(unittest.TestCase):
                     "mega_coder.corrupt_generated_code",
                     wraps=mega_coder.corrupt_generated_code,
                 ) as corrupt:
-                    with patch("mega_coder.optimize_generated_program"):
+                    with patch("mega_coder.finish_working_program"):
                         api, output = self.run_develop(
                             output_file,
                             [INVALID_CODE, SUCCESS_CODE],
@@ -223,8 +249,8 @@ class FaultInjectionTests(unittest.TestCase):
                             wraps=mega_coder.corrupt_generated_code,
                         ) as corrupt:
                             with patch(
-                                "mega_coder.optimize_generated_program"
-                            ) as optimize:
+                                "mega_coder.finish_working_program"
+                            ) as finish:
                                 api, output = self.run_develop(
                                     output_file,
                                     responses,
@@ -243,7 +269,7 @@ class FaultInjectionTests(unittest.TestCase):
         self.assertEqual(corrupt.call_count, 1)
         self.assertEqual(output.count("Repair attempt"), 5)
         self.assertNotIn(mega_coder.INJECTED_FAILURE, final_code)
-        optimize.assert_not_called()
+        finish.assert_not_called()
 
 
 class OptimizationTests(unittest.TestCase):
@@ -483,8 +509,9 @@ class OptimizationTests(unittest.TestCase):
                             "mega_coder.run_generated_program",
                             side_effect=results,
                         ):
-                            with redirect_stdout(StringIO()):
-                                mega_coder.develop_program()
+                            with patch("mega_coder.check_and_repair_lint"):
+                                with redirect_stdout(StringIO()):
+                                    mega_coder.develop_program()
 
             self.assertEqual(api.call_count, 2)
             self.assertEqual(
@@ -514,14 +541,347 @@ class OptimizationTests(unittest.TestCase):
                             "mega_coder.run_generated_program",
                             side_effect=results,
                         ):
-                            with redirect_stdout(StringIO()):
-                                mega_coder.develop_program()
+                            with patch("mega_coder.check_and_repair_lint"):
+                                with redirect_stdout(StringIO()):
+                                    mega_coder.develop_program()
 
             self.assertEqual(api.call_count, 3)
             self.assertEqual(
                 output_file.read_text(encoding="utf-8"),
                 OPTIMIZED_CODE,
             )
+
+
+class LintRepairTests(unittest.TestCase):
+    """Verify safe Pylint checks and the independent three-attempt loop."""
+
+    def run_lint_stage(self, responses, pylint_results, execution_results=None):
+        """Run the lint stage with temporary files and deterministic mocks."""
+        execution_results = execution_results or []
+        with TemporaryDirectory() as temporary_directory:
+            output_file = Path(temporary_directory) / "generated-code-openai.py"
+            output_file.write_text(WORKING_CODE, encoding="utf-8")
+            working_result = execution_result(stdout="total: 6\n")
+            with patch("mega_coder.call_openai", side_effect=responses) as api:
+                with patch(
+                    "mega_coder.run_pylint", side_effect=pylint_results
+                ) as pylint_check:
+                    with patch(
+                        "mega_coder.run_generated_program",
+                        side_effect=execution_results,
+                    ) as runner:
+                        with redirect_stdout(StringIO()) as captured:
+                            mega_coder.check_and_repair_lint(
+                                DESCRIPTION,
+                                WORKING_CODE,
+                                working_result,
+                                output_file,
+                            )
+            final_source = output_file.read_text(encoding="utf-8")
+        return api, pylint_check, runner, captured.getvalue(), final_source
+
+    def test_initially_clean_code_stops_without_api_request(self):
+        """A clean initial report prints the exact success message."""
+        api, pylint_check, runner, output, final_source = self.run_lint_stage(
+            [], [pylint_result()]
+        )
+
+        self.assertEqual(pylint_check.call_count, 1)
+        api.assert_not_called()
+        runner.assert_not_called()
+        self.assertEqual(final_source, WORKING_CODE)
+        self.assertIn("Amazing. No lint errors/warnings", output.splitlines())
+
+    def test_one_successful_lint_repair_replaces_file(self):
+        """One safe candidate can remove every diagnostic and stop the loop."""
+        api, _, runner, output, final_source = self.run_lint_stage(
+            [LINT_CLEAN_CODE],
+            [pylint_result(2), pylint_result()],
+            [execution_result(stdout="total: 6\n")],
+        )
+
+        self.assertEqual(api.call_count, 1)
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(final_source, LINT_CLEAN_CODE)
+        self.assertIn("Amazing. No lint errors/warnings", output.splitlines())
+
+    def test_gradual_improvement_uses_latest_source_and_report(self):
+        """An accepted partial repair becomes the basis of the next request."""
+        api, _, _, _, final_source = self.run_lint_stage(
+            [OPTIMIZED_CODE, LINT_CLEAN_CODE],
+            [pylint_result(3), pylint_result(1), pylint_result()],
+            [
+                execution_result(stdout="total: 6\n"),
+                execution_result(stdout="total: 6\n"),
+            ],
+        )
+
+        second_prompt = api.call_args_list[1].args[0]
+        self.assertEqual(api.call_count, 2)
+        self.assertIn(OPTIMIZED_CODE, second_prompt)
+        self.assertIn("Issue count: 1", second_prompt)
+        self.assertEqual(final_source, LINT_CLEAN_CODE)
+
+    def test_persistent_diagnostics_stop_after_exactly_three_requests(self):
+        """Three non-improving responses cannot cause a fourth request."""
+        api, _, _, output, final_source = self.run_lint_stage(
+            [OPTIMIZED_CODE] * 3,
+            [pylint_result(2)] * 4,
+            [execution_result(stdout="total: 6\n")] * 3,
+        )
+
+        self.assertEqual(api.call_count, mega_coder.MAX_LINT_REPAIR_ATTEMPTS)
+        self.assertEqual(output.count("Lint repair attempt"), 3)
+        self.assertIn("There are still lint errors/warnings", output.splitlines())
+        self.assertEqual(final_source, WORKING_CODE)
+
+    def test_invalid_and_assertion_changing_candidates_are_not_executed(self):
+        """Syntax and exact-assertion failures are rejected before execution."""
+        changed = WORKING_CODE.replace("== 6", "== 7")
+        removed = WORKING_CODE.replace("assert total([1, 2, 3]) == 6\n", "")
+        added = WORKING_CODE.replace(
+            "print(\"total:\", total([1, 2, 3]))",
+            "assert total([]) == 0\nprint(\"total:\", total([1, 2, 3]))",
+        )
+        cases = (["def broken("] * 3, [changed, removed, added])
+
+        for responses in cases:
+            with self.subTest(responses=responses):
+                _, _, runner, _, final_source = self.run_lint_stage(
+                    responses, [pylint_result(2)]
+                )
+                runner.assert_not_called()
+                self.assertEqual(final_source, WORKING_CODE)
+
+    def test_execution_failure_timeout_and_output_change_are_rejected(self):
+        """Runtime regressions cannot replace or lint the working source."""
+        results = [
+            execution_result(success=False, returncode=1, stderr="failure"),
+            execution_result(success=False, returncode=None, timed_out=True),
+            execution_result(stdout="changed\n"),
+        ]
+        _, pylint_check, _, _, final_source = self.run_lint_stage(
+            [OPTIMIZED_CODE] * 3,
+            [pylint_result(2)],
+            results,
+        )
+
+        self.assertEqual(pylint_check.call_count, 1)
+        self.assertEqual(final_source, WORKING_CODE)
+
+    def test_same_or_greater_diagnostic_count_is_not_better(self):
+        """Only a strict issue-count reduction is accepted."""
+        _, _, _, _, final_source = self.run_lint_stage(
+            [OPTIMIZED_CODE] * 3,
+            [pylint_result(2), pylint_result(2), pylint_result(3), pylint_result(2)],
+            [execution_result(stdout="total: 6\n")] * 3,
+        )
+
+        self.assertEqual(final_source, WORKING_CODE)
+
+    def test_operational_pylint_failures_stop_safely(self):
+        """Timeout, missing command, malformed output, and usage errors are not clean."""
+        failures = [
+            pylint_result(
+                command_succeeded=False,
+                timed_out=True,
+                operational_error="Pylint exceeded its execution timeout.",
+            ),
+            pylint_result(
+                command_succeeded=False,
+                returncode=None,
+                operational_error="Pylint could not start.",
+            ),
+            pylint_result(
+                command_succeeded=False,
+                returncode=1,
+                stdout="unrecognized output",
+                operational_error="Pylint output could not be interpreted safely.",
+            ),
+            pylint_result(
+                command_succeeded=False,
+                returncode=32,
+                operational_error="Pylint reported a command usage error.",
+            ),
+        ]
+
+        for failure in failures:
+            with self.subTest(error=failure.operational_error):
+                api, _, _, output, final_source = self.run_lint_stage([], [failure])
+                api.assert_not_called()
+                self.assertNotIn("Amazing. No lint errors/warnings", output)
+                self.assertEqual(final_source, WORKING_CODE)
+
+    def test_openai_failure_is_safe_and_keeps_working_file(self):
+        """The SDK exception text is not exposed by lint repair."""
+        secret_text = "private-lint-token-should-not-appear"
+        api, _, runner, output, final_source = self.run_lint_stage(
+            [mega_coder.OpenAIError(secret_text)],
+            [pylint_result(1)],
+        )
+
+        self.assertEqual(api.call_count, 1)
+        runner.assert_not_called()
+        self.assertNotIn(secret_text, output)
+        self.assertEqual(final_source, WORKING_CODE)
+
+    def test_lint_prompt_contains_complete_report_and_restrictions(self):
+        """The prompt includes trusted rules and all untrusted input sections."""
+        result = pylint_result(1, stderr="complete stderr")
+        prompt = mega_coder.build_lint_repair_prompt(
+            DESCRIPTION, WORKING_CODE, result, 2
+        )
+
+        for required_text in (
+            DESCRIPTION,
+            WORKING_CODE,
+            result.stdout,
+            result.stderr,
+            "Return code: 16",
+            "Lint repair attempt 2 of 3",
+            "untrusted",
+            "same behavior",
+            "console output",
+            "assertion",
+            "# pylint: disable",
+            "sys.argv",
+            "input()",
+            "internet",
+            "external APIs",
+            "standard library",
+            "subprocesses",
+            "files",
+        ):
+            self.assertIn(required_text, prompt)
+
+
+class PylintPipelineTests(unittest.TestCase):
+    """Verify one lint handoff after each successful development path."""
+
+    def test_optimization_acceptance_and_rejection_each_lint_once(self):
+        """The best source after either optimization decision is linted once."""
+        for accepted in (True, False):
+            with self.subTest(accepted=accepted):
+                with TemporaryDirectory() as temporary_directory:
+                    output_file = Path(temporary_directory) / "generated-code-openai.py"
+                    output_file.write_text(WORKING_CODE, encoding="utf-8")
+
+                    def optimize(
+                        *_args,
+                        accepted_result=accepted,
+                        candidate_path=output_file,
+                    ):
+                        if accepted_result:
+                            candidate_path.write_text(
+                                OPTIMIZED_CODE, encoding="utf-8"
+                            )
+                        return accepted_result
+
+                    with patch(
+                        "mega_coder.optimize_generated_program",
+                        side_effect=optimize,
+                    ):
+                        with patch(
+                            "mega_coder.check_and_repair_lint",
+                            return_value=True,
+                        ) as lint_stage:
+                            mega_coder.finish_working_program(
+                                DESCRIPTION,
+                                WORKING_CODE,
+                                execution_result(stdout="total: 6\n"),
+                                output_file,
+                            )
+
+                lint_stage.assert_called_once()
+                expected_source = OPTIMIZED_CODE if accepted else WORKING_CODE
+                self.assertEqual(lint_stage.call_args.args[1], expected_source)
+
+    def test_initial_success_reaches_lint_once(self):
+        """Initial execution success has one post-optimization lint stage."""
+        with TemporaryDirectory() as temporary_directory:
+            output_file = Path(temporary_directory) / "generated-code-openai.py"
+            with patch("mega_coder.OUTPUT_FILE", output_file):
+                with patch(
+                    "mega_coder.ask_for_program_description", return_value=DESCRIPTION
+                ):
+                    with patch("mega_coder.call_openai", return_value=WORKING_CODE):
+                        with patch(
+                            "mega_coder.run_generated_program",
+                            return_value=execution_result(stdout="total: 6\n"),
+                        ):
+                            with patch("mega_coder.optimize_generated_program"):
+                                with patch(
+                                    "mega_coder.check_and_repair_lint"
+                                ) as lint_stage:
+                                    with redirect_stdout(StringIO()):
+                                        mega_coder.develop_program()
+
+        lint_stage.assert_called_once()
+
+    def test_successful_execution_repair_reaches_lint_once(self):
+        """A working repaired file is optimized and then linted once."""
+        with TemporaryDirectory() as temporary_directory:
+            output_file = Path(temporary_directory) / "generated-code-openai.py"
+            with patch("mega_coder.call_openai", return_value=WORKING_CODE):
+                with patch(
+                    "mega_coder.run_generated_program",
+                    return_value=execution_result(stdout="total: 6\n"),
+                ):
+                    with patch("mega_coder.optimize_generated_program"):
+                        with patch(
+                            "mega_coder.check_and_repair_lint"
+                        ) as lint_stage:
+                            with redirect_stdout(StringIO()):
+                                mega_coder.repair_generated_program(
+                                    DESCRIPTION,
+                                    FAILURE_CODE,
+                                    "failure",
+                                    output_file,
+                                )
+
+        lint_stage.assert_called_once()
+
+
+class PylintRunnerTests(unittest.TestCase):
+    """Verify the real Pylint subprocess wrapper without running Pylint."""
+
+    def test_command_parsing_and_sanitized_environment(self):
+        """Pylint uses the active interpreter and counts diagnostic lines."""
+        stdout = (
+            "candidate.py:1:0: C0114: First issue (first-issue)\n"
+            "candidate.py:2:0: W0611: Second issue (second-issue)\n"
+        )
+        completed = SimpleNamespace(returncode=20, stdout=stdout, stderr="")
+        with TemporaryDirectory() as temporary_directory:
+            file_path = Path(temporary_directory) / "candidate.py"
+            file_path.write_text(WORKING_CODE, encoding="utf-8")
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "test-placeholder"}):
+                with patch(
+                    "mega_coder.subprocess.run", return_value=completed
+                ) as run_process:
+                    result = mega_coder.run_pylint(file_path)
+
+        expected_command = [
+            mega_coder.sys.executable,
+            "-m",
+            "pylint",
+            "--reports=no",
+            "--score=no",
+            "--persistent=no",
+            str(file_path.resolve()),
+        ]
+        self.assertEqual(run_process.call_args.args[0], expected_command)
+        self.assertEqual(result.issue_count, 2)
+        self.assertTrue(result.command_succeeded)
+        self.assertNotIn("OPENAI_API_KEY", run_process.call_args.kwargs["env"])
+        self.assertTrue(run_process.call_args.kwargs["capture_output"])
+        self.assertTrue(run_process.call_args.kwargs["text"])
+        self.assertFalse(run_process.call_args.kwargs["check"])
+        self.assertFalse(run_process.call_args.kwargs["shell"])
+        self.assertEqual(
+            run_process.call_args.kwargs["timeout"],
+            mega_coder.RUN_TIMEOUT_SECONDS,
+        )
 
 
 class ExecutionTimingTests(unittest.TestCase):
