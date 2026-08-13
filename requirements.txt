@@ -3,3 +3,4 @@ colorama
 tqdm
 pylint
 python-dotenv
+gitingest
