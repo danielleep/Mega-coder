@@ -1084,9 +1084,44 @@ class RepositoryIngestionTests(unittest.TestCase):
 
         self.assertIn("too large", str(raised.exception))
 
-    def test_option_two_menu_behavior_remains_not_implemented(self):
-        """Milestone 1 does not connect ingestion to the visible menu yet."""
-        with patch("builtins.input", side_effect=["2", EOFError]):
+    def test_option_two_menu_flow_ingests_without_openai(self):
+        """Option 2 asks both questions, ingests, and returns to the menu."""
+        inputs = [
+            "2",
+            "https://github.com/owner/repository.git/",
+            "Explain the validation logic",
+            EOFError,
+        ]
+        repository_result = ("summary", "tree", "content")
+        with patch("builtins.input", side_effect=inputs):
+            with patch(
+                "mega_coder.ingest", return_value=repository_result,
+            ) as mocked_ingest:
+                with patch("mega_coder.call_openai") as mocked_openai:
+                    with patch("mega_coder.just_fix_windows_console"):
+                        with redirect_stdout(StringIO()) as captured:
+                            mega_coder.main()
+
+        output = captured.getvalue()
+        mocked_ingest.assert_called_once_with(
+            "https://github.com/owner/repository"
+        )
+        mocked_openai.assert_not_called()
+        self.assertIn(
+            "Give me the full url of a public github repository:",
+            output.splitlines(),
+        )
+        self.assertIn(
+            "Tell me what you want me to fix/change/explain in that repository",
+            output.splitlines(),
+        )
+        self.assertIn("Repository ingested successfully.", output)
+        self.assertIn("Repository analysis is not connected yet.", output)
+        self.assertEqual(output.count(mega_coder.MENU), 2)
+
+    def test_invalid_url_returns_safely_to_the_menu(self):
+        """Invalid repository input neither ingests nor stops the menu loop."""
+        with patch("builtins.input", side_effect=["2", "http://example.com", EOFError]):
             with patch("mega_coder.ingest") as mocked_ingest:
                 with patch("mega_coder.call_openai") as mocked_openai:
                     with patch("mega_coder.just_fix_windows_console"):
@@ -1095,6 +1130,64 @@ class RepositoryIngestionTests(unittest.TestCase):
 
         mocked_ingest.assert_not_called()
         mocked_openai.assert_not_called()
+        self.assertIn("must use HTTPS", captured.getvalue())
+        self.assertEqual(captured.getvalue().count(mega_coder.MENU), 2)
+
+    def test_empty_request_is_rejected_before_ingestion(self):
+        """A blank requested change does not call Gitingest or OpenAI."""
+        with patch("builtins.input", side_effect=[
+            "2", "https://github.com/owner/repository", " ", EOFError,
+        ]):
+            with patch("mega_coder.ingest") as mocked_ingest:
+                with patch("mega_coder.call_openai") as mocked_openai:
+                    with patch("mega_coder.just_fix_windows_console"):
+                        with redirect_stdout(StringIO()) as captured:
+                            mega_coder.main()
+
+        mocked_ingest.assert_not_called()
+        mocked_openai.assert_not_called()
+        self.assertIn("The repository request cannot be empty.", captured.getvalue())
+
+    def test_ingestion_and_size_failures_are_reported_safely(self):
+        """Third-party and oversized-digest failures do not expose details."""
+        secret = "private Gitingest detail"
+        oversized = ("summary", "tree", "x" * mega_coder.MAX_REPOSITORY_DIGEST_CHARS)
+        cases = (
+            (RuntimeError(secret), "could not read"),
+            (oversized, "too large"),
+        )
+        for ingest_result, expected_message in cases:
+            with self.subTest(expected_message=expected_message):
+                inputs = [
+                    "2", "https://github.com/owner/repository", "Explain it", EOFError,
+                ]
+                kwargs = (
+                    {"side_effect": ingest_result}
+                    if isinstance(ingest_result, Exception)
+                    else {"return_value": ingest_result}
+                )
+                with patch("builtins.input", side_effect=inputs):
+                    with patch("mega_coder.ingest", **kwargs):
+                        with patch("mega_coder.call_openai") as mocked_openai:
+                            with patch("mega_coder.just_fix_windows_console"):
+                                with redirect_stdout(StringIO()) as captured:
+                                    mega_coder.main()
+
+                mocked_openai.assert_not_called()
+                output = captured.getvalue()
+                self.assertIn(expected_message, output)
+                self.assertNotIn(secret, output)
+                self.assertNotIn("Repository analysis is not connected yet.", output)
+
+    def test_option_three_remains_not_implemented(self):
+        """Connecting option 2 does not change option 3's placeholder."""
+        with patch("builtins.input", side_effect=["3", EOFError]):
+            with patch("mega_coder.ingest") as mocked_ingest:
+                with patch("mega_coder.just_fix_windows_console"):
+                    with redirect_stdout(StringIO()) as captured:
+                        mega_coder.main()
+
+        mocked_ingest.assert_not_called()
         self.assertIn("Not implemented yet", captured.getvalue().splitlines())
 
 

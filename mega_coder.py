@@ -214,6 +214,36 @@ def build_repository_digest(summary, tree, content):
     return digest
 
 
+def handle_repository_option():
+    """Collect, validate, and ingest one public repository without analysis."""
+    print("Give me the full url of a public github repository:")
+    repository_url = input().strip()
+    try:
+        normalized_url = validate_public_github_url(repository_url)
+    except RepositoryError as error:
+        _print_colored(str(error), Fore.RED)
+        return False
+
+    print("Tell me what you want me to fix/change/explain in that repository")
+    repository_request = input().strip()
+    if not repository_request:
+        _print_colored("The repository request cannot be empty.", Fore.YELLOW)
+        return False
+
+    try:
+        repository = ingest_public_repository(normalized_url)
+        build_repository_digest(
+            repository.summary, repository.tree, repository.content,
+        )
+    except RepositoryError as error:
+        _print_colored(str(error), Fore.RED)
+        return False
+
+    _print_colored("Repository ingested successfully.", Fore.GREEN)
+    _print_colored("Repository analysis is not connected yet.", Fore.YELLOW)
+    return True
+
+
 def _print_colored(message, color):
     """Print a colored status in terminals and plain text when redirected."""
     if sys.stdout.isatty():
@@ -1147,7 +1177,9 @@ def main():
                 develop_program()
                 return
 
-            if choice in {"2", "3"}:
+            if choice == "2":
+                handle_repository_option()
+            elif choice == "3":
                 _print_colored("Not implemented yet", Fore.YELLOW)
             else:
                 _print_colored("Please choose 1, 2, or 3.", Fore.YELLOW)
