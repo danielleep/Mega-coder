@@ -8,3 +8,4 @@ __pycache__/
 generated-code-openai.py
 .DS_Store
 .venv-old/
+.venv-python39-old/

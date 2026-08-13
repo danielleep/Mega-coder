@@ -14,10 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Optional
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
 from colorama import Fore, Style, just_fix_windows_console
+from gitingest import ingest
 from openai import OpenAI, OpenAIError
 from tqdm import tqdm
 
@@ -36,6 +38,7 @@ OUTPUT_FILE = Path(__file__).with_name("generated-code-openai.py")
 RUN_TIMEOUT_SECONDS = 30
 MAX_REPAIR_ATTEMPTS = 5
 MAX_LINT_REPAIR_ATTEMPTS = 3
+MAX_REPOSITORY_DIGEST_CHARS = 200_000
 
 # Educational repair-loop test. Keep disabled to avoid unexpected paid repairs.
 ENABLE_FAULT_INJECTION = False
@@ -100,6 +103,10 @@ class GeneratedCodeValidationError(ValueError):
     """Raised when generated source code fails the static safety checks."""
 
 
+class RepositoryError(ValueError):
+    """Raised when public repository input cannot be safely prepared."""
+
+
 @dataclass
 class ExecutionResult:
     """Store complete details from one generated-program execution."""
@@ -122,6 +129,89 @@ class PylintResult:
     timed_out: bool
     issue_count: int
     operational_error: str = ""
+
+
+@dataclass(frozen=True)
+class RepositoryData:
+    """Keep Gitingest's repository sections separate and immutable."""
+
+    summary: str
+    tree: str
+    content: str
+
+
+def validate_public_github_url(url):
+    """Validate and normalize a full public GitHub repository URL."""
+    if not isinstance(url, str) or not url.strip():
+        raise RepositoryError("The repository URL cannot be empty.")
+
+    candidate = url.strip()
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise RepositoryError("The repository URL is malformed.") from error
+
+    if parsed.scheme != "https":
+        raise RepositoryError("The repository URL must use HTTPS.")
+    if hostname not in {"github.com", "www.github.com"} or port is not None:
+        raise RepositoryError("The repository URL must use the github.com host.")
+    if parsed.username is not None or parsed.password is not None:
+        raise RepositoryError("The repository URL cannot contain credentials.")
+    if parsed.query or parsed.fragment:
+        raise RepositoryError("The repository URL cannot contain a query or fragment.")
+
+    path = parsed.path[:-1] if parsed.path.endswith("/") else parsed.path
+    path_parts = path.split("/")
+    if len(path_parts) != 3 or path_parts[0] or not all(path_parts[1:]):
+        raise RepositoryError("The URL must identify one repository owner and name.")
+    owner, repository = path_parts[1:]
+    if repository.endswith(".git"):
+        repository = repository[:-4]
+    valid_owner = re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", owner)
+    valid_repository = re.fullmatch(r"[A-Za-z0-9_.-]+", repository)
+    if not valid_owner or not valid_repository or repository in {".", ".."}:
+        raise RepositoryError("The GitHub repository owner or name is invalid.")
+    return f"https://github.com/{owner}/{repository}"
+
+
+def ingest_public_repository(url):
+    """Ingest a public repository in memory and return its structured data."""
+    normalized_url = validate_public_github_url(url)
+    try:
+        result = ingest(normalized_url)
+    # Gitingest exposes several unrelated exception types without one public base.
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        raise RepositoryError(
+            "Gitingest could not read the public GitHub repository."
+        ) from error
+
+    if not isinstance(result, tuple) or len(result) != 3:
+        raise RepositoryError("Gitingest returned a malformed repository result.")
+    summary, tree, content = result
+    if any(not isinstance(section, str) or not section.strip()
+           for section in result):
+        raise RepositoryError("Gitingest returned an empty repository result.")
+    return RepositoryData(summary, tree, content)
+
+
+def build_repository_digest(summary, tree, content):
+    """Build labeled repository context and reject an oversized digest."""
+    sections = (summary, tree, content)
+    if any(not isinstance(section, str) or not section.strip()
+           for section in sections):
+        raise RepositoryError("The repository digest sections cannot be empty.")
+    digest = (
+        f"REPOSITORY SUMMARY\n{summary}\n\n"
+        f"REPOSITORY TREE\n{tree}\n\n"
+        f"REPOSITORY CONTENT\n{content}"
+    )
+    if len(digest) > MAX_REPOSITORY_DIGEST_CHARS:
+        raise RepositoryError(
+            "The repository is too large to analyze safely in one request."
+        )
+    return digest
 
 
 def _print_colored(message, color):

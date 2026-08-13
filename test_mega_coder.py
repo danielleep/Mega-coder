@@ -1,5 +1,8 @@
 """Tests for Mega Coder's optional fault injection."""
 
+# The milestone regression suite intentionally exercises the complete application.
+# pylint: disable=too-many-lines
+
 from contextlib import redirect_stdout
 from io import StringIO
 import os
@@ -966,6 +969,133 @@ class ConsolePresentationTests(unittest.TestCase):
         progress.assert_called_once()
         self.assertTrue(progress.call_args.kwargs["disable"])
         self.assertNotIn("Repairing generated program", captured.getvalue())
+
+
+class RepositoryIngestionTests(unittest.TestCase):
+    """Verify safe public GitHub ingestion without using the network."""
+
+    def test_valid_public_github_url(self):
+        """A normal full public repository URL is accepted."""
+        self.assertEqual(
+            mega_coder.validate_public_github_url(
+                "https://github.com/openai/openai-python"
+            ),
+            "https://github.com/openai/openai-python",
+        )
+
+    def test_trailing_slash_git_suffix_and_www_are_normalized(self):
+        """Supported URL variants produce one canonical repository URL."""
+        variants = (
+            "https://github.com/owner/repository/",
+            "https://github.com/owner/repository.git",
+            "https://www.github.com/owner/repository.git/",
+        )
+        for url in variants:
+            with self.subTest(url=url):
+                self.assertEqual(
+                    mega_coder.validate_public_github_url(url),
+                    "https://github.com/owner/repository",
+                )
+
+    def test_invalid_repository_urls_are_rejected(self):
+        """Unsafe hosts, credentials, pages, and incomplete URLs fail early."""
+        invalid_urls = (
+            "", "http://github.com/owner/repository",
+            "git://github.com/owner/repository",
+            "https://example.com/owner/repository",
+            "https://github.com.evil.example/owner/repository",
+            "https://user:password@github.com/owner/repository",
+            "https://github.com", "https://github.com/owner",
+            "https://github.com/owner/repository/issues",
+            "https://github.com/owner/repository?tab=readme",
+            "https://github.com/owner/repository#readme",
+        )
+        for url in invalid_urls:
+            with self.subTest(url=url):
+                with self.assertRaises(mega_coder.RepositoryError):
+                    mega_coder.validate_public_github_url(url)
+
+    def test_successful_ingestion_returns_structured_data(self):
+        """Gitingest receives only the normalized URL and stays in memory."""
+        result = ("Repository summary", "repository tree", "file contents")
+        with patch("mega_coder.ingest", return_value=result) as mocked_ingest:
+            repository = mega_coder.ingest_public_repository(
+                "https://github.com/owner/repository.git/"
+            )
+
+        self.assertEqual(
+            repository,
+            mega_coder.RepositoryData(*result),
+        )
+        mocked_ingest.assert_called_once_with(
+            "https://github.com/owner/repository"
+        )
+        self.assertEqual(mocked_ingest.call_args.kwargs, {})
+
+    def test_empty_and_malformed_ingestion_results_are_rejected(self):
+        """Incomplete or empty third-party results become application errors."""
+        malformed_results = (
+            None,
+            ("summary", "tree"),
+            ["summary", "tree", "content"],
+            ("summary", "tree", None),
+            ("summary", " ", "content"),
+        )
+        for result in malformed_results:
+            with self.subTest(result=result):
+                with patch("mega_coder.ingest", return_value=result):
+                    with self.assertRaises(mega_coder.RepositoryError):
+                        mega_coder.ingest_public_repository(
+                            "https://github.com/owner/repository"
+                        )
+
+    def test_gitingest_exception_is_converted_to_safe_failure(self):
+        """A third-party exception is hidden behind a safe application error."""
+        secret = "private third-party detail"
+        with patch("mega_coder.ingest", side_effect=RuntimeError(secret)):
+            with self.assertRaises(mega_coder.RepositoryError) as raised:
+                mega_coder.ingest_public_repository(
+                    "https://github.com/owner/repository"
+                )
+
+        self.assertNotIn(secret, str(raised.exception))
+
+    def test_digest_is_labeled_and_allowed_at_exact_limit(self):
+        """The complete labeled digest may equal the documented size limit."""
+        smallest = mega_coder.build_repository_digest("s", "t", "c")
+        overhead = len(smallest) - 1
+        content = "c" * (mega_coder.MAX_REPOSITORY_DIGEST_CHARS - overhead)
+        digest = mega_coder.build_repository_digest("s", "t", content)
+
+        self.assertEqual(len(digest), mega_coder.MAX_REPOSITORY_DIGEST_CHARS)
+        self.assertIn("REPOSITORY SUMMARY\ns", digest)
+        self.assertIn("REPOSITORY TREE\nt", digest)
+        self.assertIn(f"REPOSITORY CONTENT\n{content}", digest)
+
+    def test_digest_over_limit_is_rejected(self):
+        """One character beyond the complete digest limit fails explicitly."""
+        smallest = mega_coder.build_repository_digest("s", "t", "c")
+        overhead = len(smallest) - 1
+        content = "c" * (
+            mega_coder.MAX_REPOSITORY_DIGEST_CHARS - overhead + 1
+        )
+        with self.assertRaises(mega_coder.RepositoryError) as raised:
+            mega_coder.build_repository_digest("s", "t", content)
+
+        self.assertIn("too large", str(raised.exception))
+
+    def test_option_two_menu_behavior_remains_not_implemented(self):
+        """Milestone 1 does not connect ingestion to the visible menu yet."""
+        with patch("builtins.input", side_effect=["2", EOFError]):
+            with patch("mega_coder.ingest") as mocked_ingest:
+                with patch("mega_coder.call_openai") as mocked_openai:
+                    with patch("mega_coder.just_fix_windows_console"):
+                        with redirect_stdout(StringIO()) as captured:
+                            mega_coder.main()
+
+        mocked_ingest.assert_not_called()
+        mocked_openai.assert_not_called()
+        self.assertIn("Not implemented yet", captured.getvalue().splitlines())
 
 
 if __name__ == "__main__":
