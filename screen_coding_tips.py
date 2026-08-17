@@ -1,6 +1,8 @@
 """Safe in-memory screen capture foundations for Mega Coder option 3."""
 
+from dataclasses import dataclass
 from importlib import import_module
+from numbers import Real
 
 
 SCREEN_CAPTURE_INTERVAL_SECONDS = 3.0
@@ -13,6 +15,19 @@ _REGION_KEYS = ("top", "left", "width", "height")
 
 class ScreenCaptureError(RuntimeError):
     """Report capture configuration or backend failures without screen data."""
+
+
+class OCRProcessingError(RuntimeError):
+    """Report local OCR failures without revealing recognized screen text."""
+
+
+@dataclass(frozen=True)
+class OCRLine:
+    """Store one recognized line and its optional confidence and position."""
+
+    text: str
+    confidence: float | None
+    position: tuple[tuple[float, float], ...] | None
 
 
 def validate_capture_region(region):
@@ -131,3 +146,98 @@ def capture_screen_frame(capture, capture_region=None, monitor_index=None):
     except Exception as error:  # pylint: disable=broad-exception-caught
         raise ScreenCaptureError("The screen capture failed.") from error
     return _convert_bgra_screenshot(screenshot)
+
+
+def create_ocr_engine():
+    """Lazily create one unified RapidOCR engine using local OpenVINO."""
+    try:
+        rapidocr = import_module("rapidocr")
+        openvino = rapidocr.EngineType.OPENVINO
+        return rapidocr.RapidOCR(
+            params={
+                "Det.engine_type": openvino,
+                "Cls.engine_type": openvino,
+                "Rec.engine_type": openvino,
+            }
+        )
+    # RapidOCR initialization may raise dependency- or backend-specific errors.
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        raise OCRProcessingError("Local OCR could not be initialized.") from error
+
+
+def _parse_rapidocr_output(result):  # pylint: disable=too-many-branches
+    """Adapt the installed RapidOCR 3.9 output fields to ordered OCR lines."""
+    try:
+        texts = result.txts
+        scores = result.scores
+        boxes = result.boxes
+
+        if texts is None:
+            if (scores is not None and len(scores) != 0) or (
+                boxes is not None and len(boxes) != 0
+            ):
+                raise ValueError
+            return ()
+        if not isinstance(texts, (list, tuple)):
+            raise TypeError
+        if not texts:
+            if (scores is not None and len(scores) != 0) or (
+                boxes is not None and len(boxes) != 0
+            ):
+                raise ValueError
+            return ()
+
+        line_count = len(texts)
+        if scores is not None and len(scores) != line_count:
+            raise ValueError
+        if boxes is not None and len(boxes) != line_count:
+            raise ValueError
+
+        lines = []
+        for index, text in enumerate(texts):
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError
+
+            confidence = None
+            if scores is not None:
+                score = scores[index]
+                if not isinstance(score, Real) or isinstance(score, bool):
+                    raise TypeError
+                confidence = float(score)
+
+            position = None
+            if boxes is not None:
+                box = boxes[index]
+                if hasattr(box, "tolist"):
+                    box = box.tolist()
+                if not isinstance(box, (list, tuple)) or len(box) != 4:
+                    raise ValueError
+                points = []
+                for point in box:
+                    if not isinstance(point, (list, tuple)) or len(point) != 2:
+                        raise ValueError
+                    if any(
+                        not isinstance(coordinate, Real)
+                        or isinstance(coordinate, bool)
+                        for coordinate in point
+                    ):
+                        raise TypeError
+                    points.append(tuple(float(value) for value in point))
+                position = tuple(points)
+
+            lines.append(OCRLine(text, confidence, position))
+    except (AttributeError, IndexError, TypeError, ValueError) as error:
+        raise OCRProcessingError(
+            "RapidOCR returned malformed recognition data."
+        ) from error
+    return tuple(lines)
+
+
+def extract_ocr_lines(frame, engine):
+    """Recognize one verified BGR frame with a reusable OCR engine."""
+    try:
+        result = engine(frame)
+    # Recognition engines may raise backend-specific exception types.
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        raise OCRProcessingError("Local OCR could not process the screen frame.") from error
+    return _parse_rapidocr_output(result)
