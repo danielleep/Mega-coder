@@ -4,3 +4,7 @@ tqdm
 pylint
 python-dotenv
 gitingest
+mss>=10.2,<11
+numpy>=1.26,<3
+rapidocr>=3.9,<4
+openvino>=2024.0,<2027
