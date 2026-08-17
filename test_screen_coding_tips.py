@@ -1,10 +1,13 @@
 """Mocked tests for the safe Option 3 screen-capture foundation."""
 
+# Milestone tests intentionally remain together with their verified foundations.
+# pylint: disable=too-many-lines
+
 from importlib import import_module
 from importlib.util import find_spec
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import screen_coding_tips as screen_tips
 
@@ -106,6 +109,33 @@ def fake_screen_tips_client(output_text="Use a clearer function name."):
     base_client = Mock()
     base_client.with_options.return_value = configured_client
     return base_client, configured_client
+
+
+class FakeClock:
+    """Provide deterministic monotonic time and non-blocking interval sleeps."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleep_calls = []
+
+    def monotonic(self):
+        """Return the injected current monotonic timestamp."""
+        return self.now
+
+    def sleep(self, seconds):
+        """Record and advance through one requested sleep without blocking."""
+        if seconds < 0:
+            raise AssertionError("Sleep must never be negative.")
+        self.sleep_calls.append(seconds)
+        self.now += seconds
+
+
+def session_capture(primary_monitor=None):
+    """Return one closable synthetic capture session for coordinator tests."""
+    capture = fake_capture()
+    capture.primary_monitor = primary_monitor or FIRST_MONITOR
+    capture.close = Mock()
+    return capture
 
 
 class CaptureConfigurationTests(unittest.TestCase):
@@ -942,9 +972,546 @@ class ScreenTipsRequestTests(unittest.TestCase):
                 self.assertFalse(result.success)
                 self.assertEqual(result.tips, "")
                 self.assertEqual(result.error_message, expected_message)
+                self.assertEqual(result.stop_session, status_code == 404)
                 self.assertNotIn(private_detail, result.error_message)
                 base_client.with_options.assert_called_once()
                 configured_client.responses.create.assert_called_once()
+
+
+class ScreenCodingTipsSessionTests(  # pylint: disable=protected-access
+    unittest.TestCase
+):
+    """Verify the bounded synchronous coordinator with mocked boundaries."""
+
+    CODE_A = "def total(values):\n    return sum(values)"
+    CODE_B = "def total(values):\n    return sum(values) + 1"
+    CODE_A_LINES = tuple(recognized_line(line) for line in CODE_A.splitlines())
+    CODE_B_LINES = tuple(recognized_line(line) for line in CODE_B.splitlines())
+
+    def test_session_initializes_once_and_makes_one_exact_request(self):
+        """Two stable frames use one target, OCR engine, and API request."""
+        base_client, configured_client = fake_screen_tips_client()
+        capture = session_capture()
+        capture_factory = Mock(return_value=capture)
+        ocr_engine = object()
+        ocr_factory = Mock(return_value=ocr_engine)
+        clock = FakeClock()
+        first_frame = object()
+        second_frame = object()
+
+        with (
+            patch.object(
+                screen_tips,
+                "resolve_capture_target",
+                wraps=screen_tips.resolve_capture_target,
+            ) as resolve_target,
+            patch.object(
+                screen_tips,
+                "_capture_resolved_screen_frame",
+                side_effect=(first_frame, second_frame),
+            ) as capture_frame,
+            patch.object(
+                screen_tips,
+                "extract_ocr_lines",
+                side_effect=(self.CODE_A_LINES, self.CODE_A_LINES),
+            ) as run_ocr,
+            patch("builtins.print") as output,
+        ):
+            screen_tips.run_screen_coding_tips(
+                base_client,
+                capture_region=EDITOR_REGION,
+                monitor_index=2,
+                capture_factory=capture_factory,
+                ocr_engine_factory=ocr_factory,
+                monotonic_clock=clock.monotonic,
+                sleep_function=clock.sleep,
+                max_iterations=2,
+            )
+
+        self.assertEqual(
+            output.call_args_list.count(
+                call(
+                    "Perfect. Show me your screen and I will be giving you "
+                    "tips on how to improve the code I see"
+                )
+            ),
+            1,
+        )
+        output.assert_any_call("Coding tips:")
+        output.assert_any_call("Use a clearer function name.")
+        capture_factory.assert_called_once_with()
+        ocr_factory.assert_called_once_with()
+        resolve_target.assert_called_once_with(
+            capture,
+            capture_region=EDITOR_REGION,
+            monitor_index=2,
+        )
+        self.assertEqual(
+            capture_frame.call_args_list,
+            [call(capture, EDITOR_REGION), call(capture, EDITOR_REGION)],
+        )
+        self.assertEqual(
+            run_ocr.call_args_list,
+            [call(first_frame, ocr_engine), call(second_frame, ocr_engine)],
+        )
+        self.assertEqual(clock.sleep_calls, [3.0])
+        capture.close.assert_called_once_with()
+        base_client.with_options.assert_called_once_with(
+            timeout=screen_tips.SCREEN_TIPS_REQUEST_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
+        request = configured_client.responses.create.call_args.kwargs
+        self.assertEqual(request["model"], "gpt-5-nano")
+        self.assertEqual(request["service_tier"], "default")
+        self.assertIs(request["store"], False)
+        self.assertEqual(request["text"], {"verbosity": "low"})
+        self.assertNotIn("tools", request)
+
+    def test_default_target_is_the_mocked_primary_monitor(self):
+        """The no-setting path keeps the documented first-monitor fallback."""
+        capture = session_capture(primary_monitor=FIRST_MONITOR)
+        capture_factory = Mock(return_value=capture)
+        ocr_factory = Mock(return_value=object())
+        clock = FakeClock()
+        base_client = Mock()
+
+        with (
+            patch.object(screen_tips, "SCREEN_CAPTURE_REGION", None),
+            patch.object(screen_tips, "SCREEN_MONITOR_INDEX", None),
+            patch.object(
+                screen_tips,
+                "_capture_resolved_screen_frame",
+                return_value=object(),
+            ) as capture_frame,
+            patch.object(screen_tips, "extract_ocr_lines", return_value=()),
+            patch.object(screen_tips, "request_screen_tips") as request_tips,
+            patch("builtins.print"),
+        ):
+            screen_tips.run_screen_coding_tips(
+                base_client,
+                capture_factory=capture_factory,
+                ocr_engine_factory=ocr_factory,
+                monotonic_clock=clock.monotonic,
+                sleep_function=clock.sleep,
+                max_iterations=1,
+            )
+
+        capture_frame.assert_called_once_with(capture, FIRST_MONITOR)
+        capture_factory.assert_called_once_with()
+        ocr_factory.assert_called_once_with()
+        request_tips.assert_not_called()
+        capture.close.assert_called_once_with()
+
+    def test_filtered_unstable_and_oversized_frames_make_no_request(self):
+        """Empty, prose, console, changing, and oversized OCR stay local."""
+        oversized_line = "private_value = " + (
+            "x" * screen_tips.MAX_SCREEN_TEXT_CHARS
+        )
+        console_lines = (
+            recognized_line(screen_tips.SCREEN_TIPS_STARTUP_MESSAGE),
+            recognized_line("Coding tips:"),
+            recognized_line("def fake_tip():"),
+        )
+        ocr_results = (
+            (),
+            (recognized_line("Ordinary prose without source code"),),
+            self.CODE_A_LINES,
+            self.CODE_B_LINES,
+            console_lines,
+            (recognized_line(oversized_line),),
+        )
+        capture = session_capture()
+        clock = FakeClock()
+
+        with (
+            patch.object(
+                screen_tips,
+                "_capture_resolved_screen_frame",
+                return_value=object(),
+            ),
+            patch.object(
+                screen_tips, "extract_ocr_lines", side_effect=ocr_results
+            ),
+            patch.object(screen_tips, "request_screen_tips") as request_tips,
+            patch("builtins.print") as output,
+        ):
+            screen_tips.run_screen_coding_tips(
+                Mock(),
+                capture_factory=Mock(return_value=capture),
+                ocr_engine_factory=Mock(return_value=object()),
+                monotonic_clock=clock.monotonic,
+                sleep_function=clock.sleep,
+                max_iterations=len(ocr_results),
+            )
+
+        request_tips.assert_not_called()
+        self.assertEqual(clock.sleep_calls, [3.0] * (len(ocr_results) - 1))
+        output.assert_any_call(
+            "The detected screen code is too large to analyze safely."
+        )
+        printed = " ".join(str(item) for item in output.call_args_list)
+        self.assertNotIn(oversized_line, printed)
+        capture.close.assert_called_once_with()
+
+    def test_unchanged_success_or_failure_is_attempted_only_once(self):
+        """Neither outcome retries unchanged code, even beyond cooldown."""
+        results = (
+            screen_tips.ScreenTipsResult(True, "Use a tuple.", ""),
+            screen_tips.ScreenTipsResult(
+                False, "", "The coding-tips request timed out."
+            ),
+        )
+        for result in results:
+            with self.subTest(success=result.success):
+                capture = session_capture()
+                clock = FakeClock()
+                request_tips = Mock(return_value=result)
+                with (
+                    patch.object(
+                        screen_tips,
+                        "_capture_resolved_screen_frame",
+                        return_value=object(),
+                    ),
+                    patch.object(
+                        screen_tips,
+                        "extract_ocr_lines",
+                        return_value=self.CODE_A_LINES,
+                    ),
+                    patch.object(
+                        screen_tips,
+                        "request_screen_tips",
+                        request_tips,
+                    ),
+                    patch("builtins.print") as output,
+                ):
+                    screen_tips.run_screen_coding_tips(
+                        Mock(),
+                        capture_factory=Mock(return_value=capture),
+                        ocr_engine_factory=Mock(return_value=object()),
+                        monotonic_clock=clock.monotonic,
+                        sleep_function=clock.sleep,
+                        max_iterations=5,
+                    )
+
+                request_tips.assert_called_once_with(ANY, self.CODE_A)
+                self.assertGreater(
+                    clock.now, screen_tips.TIP_REQUEST_COOLDOWN_SECONDS
+                )
+                if not result.success:
+                    output.assert_any_call(result.error_message)
+                capture.close.assert_called_once_with()
+
+    def test_changed_code_stabilizes_after_cooldown_and_sessions_reset(self):
+        """Changed code waits for two frames; a new session has fresh state."""
+        request_tips = Mock(
+            return_value=screen_tips.ScreenTipsResult(True, "Keep it small.", "")
+        )
+        first_capture = session_capture()
+        second_capture = session_capture()
+        capture_factory = Mock(side_effect=(first_capture, second_capture))
+        ocr_factory = Mock(return_value=object())
+        clock = FakeClock()
+
+        first_session_lines = (
+            self.CODE_A_LINES,
+            self.CODE_A_LINES,
+            self.CODE_B_LINES,
+            self.CODE_B_LINES,
+        )
+        with (
+            patch.object(
+                screen_tips,
+                "_capture_resolved_screen_frame",
+                return_value=object(),
+            ),
+            patch.object(
+                screen_tips,
+                "extract_ocr_lines",
+                side_effect=first_session_lines,
+            ),
+            patch.object(screen_tips, "request_screen_tips", request_tips),
+            patch("builtins.print"),
+        ):
+            screen_tips.run_screen_coding_tips(
+                Mock(),
+                capture_factory=capture_factory,
+                ocr_engine_factory=ocr_factory,
+                monotonic_clock=clock.monotonic,
+                sleep_function=clock.sleep,
+                max_iterations=4,
+            )
+
+        with (
+            patch.object(
+                screen_tips,
+                "_capture_resolved_screen_frame",
+                return_value=object(),
+            ),
+            patch.object(
+                screen_tips,
+                "extract_ocr_lines",
+                side_effect=(self.CODE_A_LINES, self.CODE_A_LINES),
+            ),
+            patch.object(screen_tips, "request_screen_tips", request_tips),
+            patch("builtins.print"),
+        ):
+            screen_tips.run_screen_coding_tips(
+                Mock(),
+                capture_factory=capture_factory,
+                ocr_engine_factory=ocr_factory,
+                monotonic_clock=clock.monotonic,
+                sleep_function=clock.sleep,
+                max_iterations=2,
+            )
+
+        self.assertEqual(
+            [request.args[1] for request in request_tips.call_args_list],
+            [self.CODE_A, self.CODE_B, self.CODE_A],
+        )
+        self.assertEqual(capture_factory.call_count, 2)
+        self.assertEqual(ocr_factory.call_count, 2)
+        first_capture.close.assert_called_once_with()
+        second_capture.close.assert_called_once_with()
+
+    def test_request_time_pauses_capture_and_sleep_is_never_negative(self):
+        """A slow synchronous request delays capture and yields zero sleep."""
+        capture = session_capture()
+        clock = FakeClock()
+        events = []
+
+        def capture_frame(_capture, _target):
+            events.append(("capture", clock.now))
+            return object()
+
+        def request_tips(_client, _candidate):
+            events.append(("request-start", clock.now))
+            clock.now += 4.0
+            events.append(("request-end", clock.now))
+            return screen_tips.ScreenTipsResult(True, "Keep it clear.", "")
+
+        def fake_sleep(seconds):
+            events.append(("sleep", seconds))
+            clock.sleep(seconds)
+
+        with (
+            patch.object(
+                screen_tips,
+                "_capture_resolved_screen_frame",
+                side_effect=capture_frame,
+            ),
+            patch.object(
+                screen_tips,
+                "extract_ocr_lines",
+                return_value=self.CODE_A_LINES,
+            ),
+            patch.object(
+                screen_tips, "request_screen_tips", side_effect=request_tips
+            ),
+            patch("builtins.print"),
+        ):
+            screen_tips.run_screen_coding_tips(
+                Mock(),
+                capture_factory=Mock(return_value=capture),
+                ocr_engine_factory=Mock(return_value=object()),
+                monotonic_clock=clock.monotonic,
+                sleep_function=fake_sleep,
+                max_iterations=3,
+            )
+
+        self.assertEqual(
+            events,
+            [
+                ("capture", 0.0),
+                ("sleep", 3.0),
+                ("capture", 3.0),
+                ("request-start", 3.0),
+                ("request-end", 7.0),
+                ("sleep", 0.0),
+                ("capture", 7.0),
+            ],
+        )
+        self.assertEqual(clock.sleep_calls, [3.0, 0.0])
+        self.assertTrue(all(seconds >= 0 for seconds in clock.sleep_calls))
+        capture.close.assert_called_once_with()
+
+    def test_capture_failures_are_safe_and_end_the_session(self):
+        """Initialization and frame failures reveal no backend details."""
+        private_detail = "private captured credential detail"
+        ocr_factory = Mock(return_value=object())
+        request_tips = Mock()
+
+        with (
+            patch.object(screen_tips, "request_screen_tips", request_tips),
+            patch("builtins.print") as output,
+        ):
+            screen_tips.run_screen_coding_tips(
+                Mock(),
+                capture_factory=Mock(
+                    side_effect=screen_tips.ScreenCaptureError(private_detail)
+                ),
+                ocr_engine_factory=ocr_factory,
+                monotonic_clock=FakeClock().monotonic,
+                sleep_function=Mock(),
+                max_iterations=1,
+            )
+
+        ocr_factory.assert_not_called()
+        request_tips.assert_not_called()
+        printed = " ".join(str(item) for item in output.call_args_list)
+        self.assertNotIn(private_detail, printed)
+        self.assertIn("Screen capture is unavailable", printed)
+
+        capture = session_capture()
+        with (
+            patch.object(
+                screen_tips,
+                "_capture_resolved_screen_frame",
+                side_effect=screen_tips.ScreenCaptureError(private_detail),
+            ),
+            patch.object(screen_tips, "request_screen_tips", request_tips),
+            patch("builtins.print") as output,
+        ):
+            screen_tips.run_screen_coding_tips(
+                Mock(),
+                capture_factory=Mock(return_value=capture),
+                ocr_engine_factory=ocr_factory,
+                monotonic_clock=FakeClock().monotonic,
+                sleep_function=Mock(),
+                max_iterations=1,
+            )
+
+        printed = " ".join(str(item) for item in output.call_args_list)
+        self.assertNotIn(private_detail, printed)
+        self.assertIn("Screen capture is unavailable", printed)
+        capture.close.assert_called_once_with()
+
+    def test_ocr_failure_is_safe_resets_stability_and_continues(self):
+        """A failed OCR frame cannot complete a two-frame stable pair."""
+        private_detail = "private OCR screen content"
+        capture = session_capture()
+        clock = FakeClock()
+        request_tips = Mock(
+            return_value=screen_tips.ScreenTipsResult(True, "Use names.", "")
+        )
+        ocr_results = (
+            self.CODE_A_LINES,
+            screen_tips.OCRProcessingError(private_detail),
+            self.CODE_A_LINES,
+            self.CODE_A_LINES,
+        )
+
+        with (
+            patch.object(
+                screen_tips,
+                "_capture_resolved_screen_frame",
+                return_value=object(),
+            ),
+            patch.object(
+                screen_tips, "extract_ocr_lines", side_effect=ocr_results
+            ),
+            patch.object(screen_tips, "request_screen_tips", request_tips),
+            patch("builtins.print") as output,
+        ):
+            screen_tips.run_screen_coding_tips(
+                Mock(),
+                capture_factory=Mock(return_value=capture),
+                ocr_engine_factory=Mock(return_value=object()),
+                monotonic_clock=clock.monotonic,
+                sleep_function=clock.sleep,
+                max_iterations=4,
+            )
+
+        request_tips.assert_called_once_with(ANY, self.CODE_A)
+        printed = " ".join(str(item) for item in output.call_args_list)
+        self.assertNotIn(private_detail, printed)
+        self.assertIn("Local OCR could not process", printed)
+        capture.close.assert_called_once_with()
+
+    def test_model_unavailable_stops_without_another_capture(self):
+        """A terminal mocked API status result stops the current session."""
+        capture = session_capture()
+        clock = FakeClock()
+        terminal_result = screen_tips.ScreenTipsResult(
+            False,
+            "",
+            "The gpt-5-nano model is unavailable for screen coding tips.",
+            True,
+        )
+
+        with (
+            patch.object(
+                screen_tips,
+                "_capture_resolved_screen_frame",
+                return_value=object(),
+            ) as capture_frame,
+            patch.object(
+                screen_tips,
+                "extract_ocr_lines",
+                return_value=self.CODE_A_LINES,
+            ),
+            patch.object(
+                screen_tips,
+                "request_screen_tips",
+                return_value=terminal_result,
+            ) as request_tips,
+            patch("builtins.print") as output,
+        ):
+            screen_tips.run_screen_coding_tips(
+                Mock(),
+                capture_factory=Mock(return_value=capture),
+                ocr_engine_factory=Mock(return_value=object()),
+                monotonic_clock=clock.monotonic,
+                sleep_function=clock.sleep,
+                max_iterations=5,
+            )
+
+        self.assertEqual(capture_frame.call_count, 2)
+        request_tips.assert_called_once_with(ANY, self.CODE_A)
+        output.assert_any_call(terminal_result.error_message)
+        capture.close.assert_called_once_with()
+
+    def test_keyboard_interrupt_propagates_after_capture_cleanup(self):
+        """The existing top-level handler can still print its graceful exit."""
+        capture = session_capture()
+        with (
+            patch.object(
+                screen_tips,
+                "_capture_resolved_screen_frame",
+                side_effect=KeyboardInterrupt,
+            ),
+            patch.object(screen_tips, "request_screen_tips") as request_tips,
+            patch("builtins.print"),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                screen_tips.run_screen_coding_tips(
+                    Mock(),
+                    capture_factory=Mock(return_value=capture),
+                    ocr_engine_factory=Mock(return_value=object()),
+                    monotonic_clock=FakeClock().monotonic,
+                    sleep_function=Mock(),
+                    max_iterations=1,
+                )
+
+        request_tips.assert_not_called()
+        capture.close.assert_called_once_with()
+
+    def test_session_dependency_loggers_keep_warnings_and_errors(self):
+        """Only routine INFO output is suppressed for screen dependencies."""
+        loggers = {
+            name: Mock() for name in screen_tips._SCREEN_DEPENDENCY_LOGGERS
+        }
+        with patch.object(
+            screen_tips.logging,
+            "getLogger",
+            side_effect=lambda name: loggers[name],
+        ) as get_logger:
+            screen_tips._configure_screen_dependency_logging()
+
+        self.assertEqual(get_logger.call_count, len(loggers))
+        for dependency_logger in loggers.values():
+            dependency_logger.setLevel.assert_called_once_with(
+                screen_tips.logging.WARNING
+            )
 
 
 if __name__ == "__main__":

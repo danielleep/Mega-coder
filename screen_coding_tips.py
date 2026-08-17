@@ -2,9 +2,12 @@
 
 from dataclasses import dataclass, field
 from importlib import import_module
+import logging
 from math import isfinite
 from numbers import Real
 import re
+from time import monotonic as monotonic_time
+from time import sleep as sleep_for
 
 from openai import (
     APIConnectionError,
@@ -32,6 +35,20 @@ MIN_OCR_CONFIDENCE = 0.60
 SCREEN_TIPS_REQUEST_TIMEOUT_SECONDS = 60.0
 SCREEN_CAPTURE_REGION = None
 SCREEN_MONITOR_INDEX = None
+SCREEN_TIPS_STARTUP_MESSAGE = (
+    "Perfect. Show me your screen and I will be giving you tips on how to "
+    "improve the code I see"
+)
+SCREEN_TIPS_OUTPUT_LABEL = "Coding tips:"
+
+_SCREEN_DEPENDENCY_LOGGERS = (
+    "httpcore",
+    "httpx",
+    "mss",
+    "openai",
+    "openvino",
+    "rapidocr",
+)
 
 _REGION_KEYS = ("top", "left", "width", "height")
 _CODE_KEYWORD = re.compile(
@@ -97,6 +114,12 @@ _IGNORED_SCREEN_PREFIXES = (
     "code running time optimized!",
     "amazing. no lint errors/warnings",
     "there are still lint errors/warnings",
+    "the screen capture",
+    "local ocr",
+    "the detected screen code",
+    "the coding-tips request",
+    "openai returned no coding tips",
+    "the gpt-5-nano model is unavailable",
 ) + _TIP_LABEL_PREFIXES
 _CREDENTIAL_IDENTIFIER = (
     r"(?:[A-Za-z][A-Za-z0-9]*[_-])*"
@@ -194,6 +217,7 @@ class ScreenTipsResult:
     success: bool
     tips: str
     error_message: str
+    stop_session: bool = False
 
 
 def validate_capture_region(region):
@@ -303,15 +327,31 @@ def _convert_bgra_screenshot(screenshot):
     return bgr
 
 
-def capture_screen_frame(capture, capture_region=None, monitor_index=None):
-    """Capture one resolved target in memory without saving or retaining it."""
-    target = resolve_capture_target(capture, capture_region, monitor_index)
+def create_capture_backend():
+    """Lazily initialize one MSS capture backend for a screen session."""
+    try:
+        return import_module("mss").mss()
+    # MSS may raise platform-specific errors for missing capture permission.
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        raise ScreenCaptureError(
+            "The screen capture backend could not be initialized."
+        ) from error
+
+
+def _capture_resolved_screen_frame(capture, target):
+    """Capture one already-resolved target without re-reading settings."""
     try:
         screenshot = capture.grab(target)
     # Capture backends may raise platform-specific exception types.
     except Exception as error:  # pylint: disable=broad-exception-caught
         raise ScreenCaptureError("The screen capture failed.") from error
     return _convert_bgra_screenshot(screenshot)
+
+
+def capture_screen_frame(capture, capture_region=None, monitor_index=None):
+    """Capture one resolved target in memory without saving or retaining it."""
+    target = resolve_capture_target(capture, capture_region, monitor_index)
+    return _capture_resolved_screen_frame(capture, target)
 
 
 def create_ocr_engine():
@@ -514,9 +554,9 @@ def build_delimited_screen_input(text):
     )
 
 
-def _screen_tips_failure(message):
+def _screen_tips_failure(message, stop_session=False):
     """Return a failure that contains neither captured text nor SDK details."""
-    return ScreenTipsResult(False, "", message)
+    return ScreenTipsResult(False, "", message, stop_session)
 
 
 def request_screen_tips(base_client, text):
@@ -548,7 +588,8 @@ def request_screen_tips(base_client, text):
     except APIStatusError as error:
         if getattr(error, "status_code", None) == 404:
             result = _screen_tips_failure(
-                "The gpt-5-nano model is unavailable for screen coding tips."
+                "The gpt-5-nano model is unavailable for screen coding tips.",
+                stop_session=True,
             )
         else:
             result = _screen_tips_failure(
@@ -782,3 +823,150 @@ class StableCodeTracker:  # pylint: disable=too-many-instance-attributes
         if normalized != self.last_attempted_normalized_text:
             raise ValueError("Only the last attempted candidate can succeed.")
         self.last_successfully_analyzed_normalized_text = normalized
+
+
+def _configure_screen_dependency_logging():
+    """Suppress dependency INFO logs while preserving warnings and errors."""
+    for logger_name in _SCREEN_DEPENDENCY_LOGGERS:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
+def _close_capture_backend(capture):
+    """Close one capture backend without exposing backend exception details."""
+    close_capture = getattr(capture, "close", None)
+    if not callable(close_capture):
+        return
+    try:
+        close_capture()
+    # Capture backends may raise platform-specific exception types.
+    except Exception:  # pylint: disable=broad-exception-caught
+        print("The screen capture backend could not close cleanly.")
+
+
+def _request_tips_for_candidate(client, tracker, candidate, monotonic_clock):
+    """Redact, record, synchronously request, and print one stable candidate."""
+    try:
+        redact_sensitive_text(candidate)
+    except ScreenTextTooLargeError:
+        print("The detected screen code is too large to analyze safely.")
+        return False
+    except UnsafeScreenContentError:
+        print("The detected screen code may contain unsafe credential content.")
+        return False
+
+    if not tracker.mark_attempted(candidate, monotonic_clock()):
+        return False
+
+    result = request_screen_tips(client, candidate)
+    if result.success:
+        tracker.mark_successful(candidate)
+        print(SCREEN_TIPS_OUTPUT_LABEL)
+        print(result.tips)
+    else:
+        print(result.error_message)
+    return result.stop_session
+
+
+def _process_screen_iteration(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    client, capture, target, ocr_engine, tracker, monotonic_clock
+):
+    """Process one captured frame and report whether the session must stop."""
+    frame = _capture_resolved_screen_frame(capture, target)
+    try:
+        ocr_lines = extract_ocr_lines(frame, ocr_engine)
+        candidate = extract_code_candidate(ocr_lines)
+        ready_candidate = tracker.observe_candidate(candidate, monotonic_clock())
+    except OCRProcessingError:
+        tracker.observe_candidate("", monotonic_clock())
+        print("Local OCR could not process the current screen frame.")
+        return False
+    except ScreenTextTooLargeError:
+        tracker.observe_candidate("", monotonic_clock())
+        print("The detected screen code is too large to analyze safely.")
+        return False
+
+    if ready_candidate is None:
+        return False
+    return _request_tips_for_candidate(
+        client, tracker, ready_candidate, monotonic_clock
+    )
+
+
+def _validate_iteration_limit(max_iterations):
+    """Validate the optional bounded-loop test boundary."""
+    if max_iterations is None:
+        return
+    if (
+        not isinstance(max_iterations, int)
+        or isinstance(max_iterations, bool)
+        or max_iterations < 0
+    ):
+        raise ValueError("The iteration limit must be a non-negative integer.")
+
+
+def run_screen_coding_tips(  # pylint: disable=too-many-arguments,too-many-locals
+    client,
+    capture_region=None,
+    monitor_index=None,
+    *,
+    capture_factory=None,
+    ocr_engine_factory=None,
+    monotonic_clock=None,
+    sleep_function=None,
+    max_iterations=None,
+):
+    """Run one synchronous, near-real-time screen coding-tips session."""
+    _validate_iteration_limit(max_iterations)
+    capture_factory = capture_factory or create_capture_backend
+    ocr_engine_factory = ocr_engine_factory or create_ocr_engine
+    monotonic_clock = monotonic_clock or monotonic_time
+    sleep_function = sleep_function or sleep_for
+    tracker = StableCodeTracker()
+    capture = None
+
+    print(SCREEN_TIPS_STARTUP_MESSAGE)
+    _configure_screen_dependency_logging()
+
+    try:
+        capture = capture_factory()
+        target = resolve_capture_target(
+            capture,
+            capture_region=capture_region,
+            monitor_index=monitor_index,
+        )
+        ocr_engine = ocr_engine_factory()
+
+        iteration_count = 0
+        while max_iterations is None or iteration_count < max_iterations:
+            iteration_started = monotonic_clock()
+            should_stop = _process_screen_iteration(
+                client,
+                capture,
+                target,
+                ocr_engine,
+                tracker,
+                monotonic_clock,
+            )
+            iteration_count += 1
+            if should_stop or (
+                max_iterations is not None
+                and iteration_count >= max_iterations
+            ):
+                return
+
+            elapsed = monotonic_clock() - iteration_started
+            remaining = max(0.0, SCREEN_CAPTURE_INTERVAL_SECONDS - elapsed)
+            sleep_function(remaining)
+    except ScreenCaptureError:
+        print(
+            "Screen capture is unavailable. Check screen-recording permission "
+            "and capture settings."
+        )
+    except OCRProcessingError:
+        print(
+            "Local OCR is unavailable. Check the RapidOCR and OpenVINO "
+            "installation."
+        )
+    finally:
+        if capture is not None:
+            _close_capture_backend(capture)
