@@ -92,6 +92,11 @@ def ocr_result(texts, scores, boxes):
     return SimpleNamespace(txts=texts, scores=scores, boxes=boxes)
 
 
+def recognized_line(text, confidence=0.99):
+    """Create harmless synthetic OCR text for local candidate tests."""
+    return screen_tips.OCRLine(text, confidence, None)
+
+
 class CaptureConfigurationTests(unittest.TestCase):
     """Verify validation and deterministic target precedence."""
 
@@ -99,6 +104,9 @@ class CaptureConfigurationTests(unittest.TestCase):
         """Capture timing and stabilization retain their exact defaults."""
         self.assertEqual(screen_tips.SCREEN_CAPTURE_INTERVAL_SECONDS, 3.0)
         self.assertEqual(screen_tips.STABLE_FRAME_COUNT, 2)
+        self.assertEqual(screen_tips.TIP_REQUEST_COOLDOWN_SECONDS, 5.0)
+        self.assertEqual(screen_tips.MAX_SCREEN_TEXT_CHARS, 12_000)
+        self.assertEqual(screen_tips.MIN_OCR_CONFIDENCE, 0.60)
         self.assertIsNone(screen_tips.SCREEN_CAPTURE_REGION)
         self.assertIsNone(screen_tips.SCREEN_MONITOR_INDEX)
 
@@ -417,6 +425,265 @@ class RapidOCRAdapterTests(unittest.TestCase):
         file_open.assert_not_called()
         self.assertNotIn("openai", vars(screen_tips))
         self.assertNotIn("socket", vars(screen_tips))
+
+
+class CodeCandidateTests(unittest.TestCase):
+    """Verify deterministic OCR filtering, detection, and normalization."""
+
+    def test_empty_text_and_normal_prose_are_rejected(self):
+        """Empty lines and ordinary sentences do not become source code."""
+        self.assertEqual(screen_tips.extract_code_candidate(()), "")
+        prose = (recognized_line("This is a normal sentence about a function."),)
+        self.assertEqual(screen_tips.extract_code_candidate(prose), "")
+        self.assertFalse(screen_tips.looks_like_code(""))
+        self.assertFalse(
+            screen_tips.looks_like_code(
+                "This is a normal sentence about a function."
+            )
+        )
+
+    def test_low_confidence_lines_are_removed_before_selection(self):
+        """Very uncertain OCR text is discarded while confidence stays local."""
+        lines = (
+            recognized_line(
+                "def uncertain_screen_text():", screen_tips.MIN_OCR_CONFIDENCE - 0.01
+            ),
+            recognized_line("visible_value = 1"),
+        )
+
+        candidate = screen_tips.extract_code_candidate(lines)
+
+        self.assertEqual(candidate, "visible_value = 1")
+        self.assertNotIn("uncertain_screen_text", candidate)
+
+    def test_editor_chrome_menu_status_and_tip_labels_are_ignored(self):
+        """Obvious UI and Mega Coder console text cannot become a candidate."""
+        lines = tuple(
+            recognized_line(text)
+            for text in (
+                "File Edit Selection View Go Run Terminal Help",
+                "Explorer",
+                "I’m Mega Coder. What would you like me to do today?",
+                "1. Develop a python program.",
+                "Not implemented yet",
+                "Ln 12, Col 4 Spaces: 4 UTF-8 LF",
+                "Coding tips:",
+                "def previously_printed_tip():",
+                "    return 'not editor code'",
+            )
+        )
+
+        self.assertEqual(screen_tips.extract_code_candidate(lines), "")
+
+    def test_mixed_screen_selects_only_the_strongest_code_block(self):
+        """A mixed editor and console fixture returns only likely source code."""
+        lines = tuple(
+            recognized_line(text)
+            for text in (
+                "Explorer",
+                "example.py",
+                "def add(left, right):",
+                "    return left + right",
+                "Terminal",
+                "I’m Mega Coder. What would you like me to do today?",
+                "Coding tips:",
+                "Keep each function focused.",
+            )
+        )
+
+        self.assertEqual(
+            screen_tips.extract_code_candidate(lines),
+            "def add(left, right):\n    return left + right",
+        )
+
+    def test_normalization_changes_only_the_permitted_whitespace(self):
+        """Case, indentation, internal spacing, and meaningful text survive."""
+        source = "\r\n  Def MixedCase(value):  \r\treturn  Value + 1\t\r\n\r\n"
+
+        normalized = screen_tips.normalize_code_candidate(source)
+
+        self.assertEqual(
+            normalized,
+            "  Def MixedCase(value):\n\treturn  Value + 1",
+        )
+        self.assertIn("MixedCase", normalized)
+        self.assertIn("return  Value", normalized)
+
+    def test_representative_code_is_accepted_but_one_signal_is_not(self):
+        """Python and common code forms need multiple independent signals."""
+        accepted = (
+            "def greet():\n    return 'hello'",
+            "total = add(1, 2)",
+            "const total = add(1, 2);",
+            "if ready:\n    print('ready')",
+        )
+        rejected = ("return", "()", "hello", "function")
+        for candidate in accepted:
+            with self.subTest(candidate=candidate):
+                self.assertTrue(screen_tips.looks_like_code(candidate))
+        for candidate in rejected:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(screen_tips.looks_like_code(candidate))
+
+    def test_oversized_text_is_rejected_without_truncation(self):
+        """The exact boundary passes and one extra character raises an error."""
+        at_limit = "x = " + "a" * (screen_tips.MAX_SCREEN_TEXT_CHARS - 4)
+        over_limit = at_limit + "b"
+
+        self.assertEqual(screen_tips.normalize_code_candidate(at_limit), at_limit)
+        with self.assertRaises(screen_tips.ScreenTextTooLargeError):
+            screen_tips.normalize_code_candidate(over_limit)
+        with self.assertRaises(screen_tips.ScreenTextTooLargeError):
+            screen_tips.extract_code_candidate((recognized_line(over_limit),))
+
+
+class StableCodeTrackerTests(unittest.TestCase):
+    """Verify exact two-frame stability and deterministic cooldown state."""
+
+    CODE_A = "def alpha():\n    return 1"
+    CODE_B = "def beta():\n    return 2"
+    CODE_C = "def gamma():\n    return 3"
+
+    def test_partial_changing_frames_never_become_ready(self):
+        """Every exact change resets the consecutive frame count to one."""
+        tracker = screen_tips.StableCodeTracker()
+        candidates = ("value = 1", "value = 2", "value = 3", "value = 4")
+
+        results = [
+            tracker.observe_candidate(candidate, timestamp)
+            for timestamp, candidate in enumerate(candidates)
+        ]
+
+        self.assertEqual(results, [None, None, None, None])
+        self.assertEqual(tracker.current_normalized_candidate, "value = 4")
+        self.assertEqual(tracker.current_candidate_frame_count, 1)
+
+    def test_two_identical_candidates_are_ready_exactly_once(self):
+        """The second exact frame emits once until it is marked attempted."""
+        tracker = screen_tips.StableCodeTracker()
+
+        self.assertIsNone(tracker.observe_candidate(self.CODE_A, 0.0))
+        self.assertEqual(tracker.observe_candidate(self.CODE_A, 1.0), self.CODE_A)
+        self.assertIsNone(tracker.observe_candidate(self.CODE_A, 2.0))
+        self.assertTrue(tracker.mark_attempted(self.CODE_A, 2.0))
+        self.assertFalse(tracker.mark_attempted(self.CODE_A, 2.0))
+        self.assertEqual(tracker.last_attempted_normalized_text, self.CODE_A)
+        self.assertEqual(tracker.last_api_attempt_time, 2.0)
+
+    def test_every_meaningful_one_character_change_resets_stability(self):
+        """Identifiers, literals, operators, indentation, and punctuation differ."""
+        changed_pairs = (
+            ("value = 1", "values = 1"),
+            ("value = 1", "value = 2"),
+            ("value = 'A'", "value = 'B'"),
+            ("if value == 1:", "if value != 1:"),
+            (" value = 1", "  value = 1"),
+            ("if ready:", "if ready;"),
+        )
+        for original, changed in changed_pairs:
+            with self.subTest(original=original, changed=changed):
+                tracker = screen_tips.StableCodeTracker()
+                self.assertIsNone(tracker.observe_candidate(original, 0.0))
+                self.assertIsNone(tracker.observe_candidate(changed, 1.0))
+                self.assertEqual(
+                    tracker.current_normalized_candidate,
+                    screen_tips.normalize_code_candidate(changed),
+                )
+                self.assertEqual(tracker.current_candidate_frame_count, 1)
+                self.assertEqual(
+                    tracker.observe_candidate(changed, 2.0),
+                    screen_tips.normalize_code_candidate(changed),
+                )
+
+    def test_failed_attempt_is_never_retried_while_unchanged(self):
+        """An attempted candidate stays blocked without a success marker."""
+        tracker = screen_tips.StableCodeTracker()
+        tracker.observe_candidate(self.CODE_A, 0.0)
+        ready = tracker.observe_candidate(self.CODE_A, 1.0)
+        self.assertTrue(tracker.mark_attempted(ready, 1.0))
+
+        for timestamp in (10.0, 20.0, 100.0):
+            self.assertIsNone(tracker.observe_candidate(self.CODE_A, timestamp))
+
+        self.assertEqual(tracker.last_attempted_normalized_text, self.CODE_A)
+        self.assertIsNone(tracker.last_successfully_analyzed_normalized_text)
+
+    def test_successful_candidate_remains_blocked_after_another_failure(self):
+        """Last-success state independently prevents redundant analysis."""
+        tracker = screen_tips.StableCodeTracker()
+        tracker.observe_candidate(self.CODE_A, 0.0)
+        ready_a = tracker.observe_candidate(self.CODE_A, 1.0)
+        tracker.mark_attempted(ready_a, 1.0)
+        tracker.mark_successful(ready_a)
+
+        tracker.observe_candidate(self.CODE_B, 6.0)
+        ready_b = tracker.observe_candidate(self.CODE_B, 7.0)
+        tracker.mark_attempted(ready_b, 7.0)
+        tracker.observe_candidate(self.CODE_A, 12.0)
+
+        self.assertIsNone(tracker.observe_candidate(self.CODE_A, 13.0))
+        self.assertEqual(
+            tracker.last_successfully_analyzed_normalized_text, self.CODE_A
+        )
+        self.assertEqual(tracker.last_attempted_normalized_text, self.CODE_B)
+
+    def test_different_stable_candidate_waits_for_exact_cooldown(self):
+        """A changed stable candidate remains pending until cooldown expires."""
+        tracker = screen_tips.StableCodeTracker()
+        tracker.observe_candidate(self.CODE_A, 9.0)
+        ready_a = tracker.observe_candidate(self.CODE_A, 10.0)
+        tracker.mark_attempted(ready_a, 10.0)
+
+        self.assertIsNone(tracker.observe_candidate(self.CODE_B, 11.0))
+        self.assertIsNone(tracker.observe_candidate(self.CODE_B, 12.0))
+        self.assertIsNone(tracker.observe_candidate(self.CODE_B, 14.999))
+        self.assertEqual(tracker.observe_candidate(self.CODE_B, 15.0), self.CODE_B)
+
+    def test_newest_stable_candidate_replaces_pending_candidate(self):
+        """Changed text resets stability and only the newest block can be ready."""
+        tracker = screen_tips.StableCodeTracker()
+        tracker.observe_candidate(self.CODE_A, 0.0)
+        ready_a = tracker.observe_candidate(self.CODE_A, 0.0)
+        tracker.mark_attempted(ready_a, 0.0)
+        tracker.observe_candidate(self.CODE_B, 1.0)
+        tracker.observe_candidate(self.CODE_B, 2.0)
+        tracker.observe_candidate(self.CODE_C, 3.0)
+        self.assertIsNone(tracker.observe_candidate(self.CODE_C, 4.0))
+
+        self.assertEqual(tracker.observe_candidate(self.CODE_C, 5.0), self.CODE_C)
+        self.assertEqual(tracker.current_normalized_candidate, self.CODE_C)
+
+    def test_new_tracker_resets_all_session_state(self):
+        """Constructing a tracker starts with no candidate or request history."""
+        tracker = screen_tips.StableCodeTracker()
+        tracker.observe_candidate(self.CODE_A, 0.0)
+        ready = tracker.observe_candidate(self.CODE_A, 1.0)
+        tracker.mark_attempted(ready, 1.0)
+        tracker.mark_successful(ready)
+
+        fresh = screen_tips.StableCodeTracker()
+
+        self.assertIsNone(fresh.current_normalized_candidate)
+        self.assertEqual(fresh.current_candidate_frame_count, 0)
+        self.assertIsNone(fresh.last_attempted_normalized_text)
+        self.assertIsNone(fresh.last_successfully_analyzed_normalized_text)
+        self.assertIsNone(fresh.last_api_attempt_time)
+
+    def test_local_analysis_has_no_external_or_timing_side_effects(self):
+        """Candidate and tracker logic never capture, OCR, sleep, or access APIs."""
+        lines = (recognized_line("value = 1"),)
+        with patch.object(screen_tips, "capture_screen_frame") as capture:
+            with patch.object(screen_tips, "create_ocr_engine") as create_ocr:
+                with patch.object(screen_tips, "extract_ocr_lines") as run_ocr:
+                    candidate = screen_tips.extract_code_candidate(lines)
+                    tracker = screen_tips.StableCodeTracker()
+                    tracker.observe_candidate(candidate, 0.0)
+
+        capture.assert_not_called()
+        create_ocr.assert_not_called()
+        run_ocr.assert_not_called()
+        self.assertNotIn("time", vars(screen_tips))
+        self.assertNotIn("openai", vars(screen_tips))
 
 
 if __name__ == "__main__":
