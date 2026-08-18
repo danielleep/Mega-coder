@@ -1,5 +1,8 @@
 """Safe local screen-analysis foundations for Mega Coder option 3."""
 
+# Option 3's six verified milestones intentionally remain in one focused module.
+# pylint: disable=too-many-lines
+
 from dataclasses import dataclass, field
 from importlib import import_module
 import logging
@@ -39,15 +42,17 @@ SCREEN_TIPS_STARTUP_MESSAGE = (
     "Perfect. Show me your screen and I will be giving you tips on how to "
     "improve the code I see"
 )
+SCREEN_TIPS_USAGE_INSTRUCTIONS = """For best results:
+- Open your IDE full screen.
+- Hide the sidebar.
+- Run Mega Coder in the IDE terminal below the editor.
+- Configure the capture region so it contains only the editor, not the terminal."""
+SCREEN_TIPS_OUTPUT_BOUNDARY = (
+    "---------------- MEGA CODER TIPS BELOW ----------------"
+)
 SCREEN_TIPS_OUTPUT_LABEL = "Coding tips:"
-
-_SCREEN_DEPENDENCY_LOGGERS = (
-    "httpcore",
-    "httpx",
-    "mss",
-    "openai",
-    "openvino",
-    "rapidocr",
+SCREEN_TIPS_OUTPUT_END = (
+    "---------------------------------------------------------"
 )
 
 _REGION_KEYS = ("top", "left", "width", "height")
@@ -66,6 +71,7 @@ _STATUS_BAR = re.compile(
     r"^(?:ln\s+\d+,\s*col\s+\d+|spaces:\s*\d+|utf-8\b|"
     r"(?:crlf|lf)\b|go live\b)"
 )
+_OUTPUT_SEPARATOR = re.compile(r"^-{10,}$")
 _IGNORED_SCREEN_LINES = frozenset(
     {
         "file edit selection view go run terminal help",
@@ -90,6 +96,12 @@ _IGNORED_SCREEN_LINES = frozenset(
         "goodbye.",
         "perfect. show me your screen and i will be giving you tips on how to "
         "improve the code i see",
+        "for best results:",
+        "- open your ide full screen.",
+        "- hide the sidebar.",
+        "- run mega coder in the ide terminal below the editor.",
+        "- configure the capture region so it contains only the editor, not "
+        "the terminal.",
     }
 )
 _TIP_LABEL_PREFIXES = (
@@ -656,6 +668,7 @@ def _is_ignored_screen_line(text):
         normalized in _IGNORED_SCREEN_LINES
         or normalized.startswith(_IGNORED_SCREEN_PREFIXES)
         or bool(_STATUS_BAR.match(normalized))
+        or bool(_OUTPUT_SEPARATOR.fullmatch(normalized))
     )
 
 
@@ -665,13 +678,89 @@ def _is_tip_label(text):
     return normalized.startswith(_TIP_LABEL_PREFIXES)
 
 
-def extract_code_candidate(lines):
-    """Select the strongest contiguous code-like block from untrusted OCR lines."""
-    blocks = []
-    current_block = []
+def _is_output_boundary(text):
+    """Recognize the tips boundary without depending on its punctuation."""
+    without_surrounding_punctuation = re.sub(
+        r"^[\W_]+|[\W_]+$", "", text.casefold()
+    )
+    normalized = " ".join(without_surrounding_punctuation.split())
+    return normalized == "mega coder tips below"
+
+
+def _line_top(line):
+    """Return the top vertical OCR coordinate when geometry is available."""
+    if line.position is None:
+        return None
+    return min(point[1] for point in line.position)
+
+
+def _line_bottom(line):
+    """Return the bottom vertical OCR coordinate when geometry is available."""
+    if line.position is None:
+        return None
+    return max(point[1] for point in line.position)
+
+
+def _code_line_spacing(previous_line, current_line):
+    """Classify nearby code lines without merging distant screen regions."""
+    previous_top = _line_top(previous_line)
+    previous_bottom = _line_bottom(previous_line)
+    current_top = _line_top(current_line)
+    current_bottom = _line_bottom(current_line)
+    if None in (previous_top, previous_bottom, current_top, current_bottom):
+        return "adjacent"
+
+    line_height = max(
+        previous_bottom - previous_top,
+        current_bottom - current_top,
+        1.0,
+    )
+    if current_top < previous_top:
+        return "distant"
+
+    vertical_gap = current_top - previous_bottom
+    if vertical_gap > line_height * 3:
+        return "distant"
+    if vertical_gap > line_height:
+        return "blank"
+    return "adjacent"
+
+
+def _exclude_terminal_output(lines):
+    """Keep only OCR lines proven to be visually above the first boundary."""
+    boundary_tops = [
+        _line_top(line)
+        for line in lines
+        if _is_output_boundary(line.text) and _line_top(line) is not None
+    ]
+    if not boundary_tops:
+        if any(_is_output_boundary(line.text) for line in lines):
+            return ()
+        return lines
+
+    first_boundary_top = min(boundary_tops)
+    return tuple(
+        line
+        for line in lines
+        if not _is_output_boundary(line.text)
+        and _line_top(line) is not None
+        and _line_top(line) < first_boundary_top
+    )
+
+
+def extract_code_candidate(  # pylint: disable=too-many-branches,too-many-statements
+    lines,
+):
+    """Select the strongest nearby code-like block from untrusted OCR lines."""
+    lines = tuple(lines)
     for line in lines:
         if not isinstance(line, OCRLine):
             raise TypeError("OCR lines must use the OCRLine structure.")
+
+    blocks = []
+    current_block = []
+    previous_code_line = None
+    for line in _exclude_terminal_output(lines):
         if (
             line.confidence is not None
             and line.confidence < MIN_OCR_CONFIDENCE
@@ -684,23 +773,45 @@ def extract_code_candidate(lines):
         if _is_ignored_screen_line(line.text):
             blocks.append(current_block)
             current_block = []
+            previous_code_line = None
+            continue
+
+        if not line.text.strip():
+            if current_block and current_block[-1][0]:
+                current_block.append(("", 0))
+            elif current_block:
+                blocks.append(current_block)
+                current_block = []
+                previous_code_line = None
             continue
 
         line_score = _line_code_score(line.text)
         if line_score:
+            if previous_code_line is not None:
+                spacing = _code_line_spacing(previous_code_line, line)
+                if spacing == "distant":
+                    blocks.append(current_block)
+                    current_block = []
+                elif spacing == "blank" and current_block[-1][0]:
+                    current_block.append(("", 0))
             current_block.append((line.text, line_score))
+            previous_code_line = line
         elif current_block:
             blocks.append(current_block)
             current_block = []
+            previous_code_line = None
     blocks.append(current_block)
 
     best_candidate = ""
     best_rank = (0, 0)
     for block in blocks:
-        candidate = "\n".join(text for text, _score in block)
+        candidate = "\n".join(text for text, _score in block).rstrip("\n")
         if not looks_like_code(candidate):
             continue
-        rank = (sum(score for _text, score in block), len(block))
+        rank = (
+            sum(score for _text, score in block),
+            sum(bool(text) for text, _score in block),
+        )
         if rank > best_rank:
             best_candidate = candidate
             best_rank = rank
@@ -826,9 +937,15 @@ class StableCodeTracker:  # pylint: disable=too-many-instance-attributes
 
 
 def _configure_screen_dependency_logging():
-    """Suppress dependency INFO logs while preserving warnings and errors."""
-    for logger_name in _SCREEN_DEPENDENCY_LOGGERS:
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    """Temporarily suppress INFO logs without weakening an existing setting."""
+    previous_disable_level = logging.root.manager.disable
+    logging.disable(max(previous_disable_level, logging.INFO))
+    return previous_disable_level
+
+
+def _restore_screen_dependency_logging(previous_disable_level):
+    """Restore the logging threshold used before the Option 3 session."""
+    logging.disable(previous_disable_level)
 
 
 def _close_capture_backend(capture):
@@ -860,8 +977,10 @@ def _request_tips_for_candidate(client, tracker, candidate, monotonic_clock):
     result = request_screen_tips(client, candidate)
     if result.success:
         tracker.mark_successful(candidate)
+        print(SCREEN_TIPS_OUTPUT_BOUNDARY)
         print(SCREEN_TIPS_OUTPUT_LABEL)
         print(result.tips)
+        print(SCREEN_TIPS_OUTPUT_END)
     else:
         print(result.error_message)
     return result.stop_session
@@ -925,7 +1044,8 @@ def run_screen_coding_tips(  # pylint: disable=too-many-arguments,too-many-local
     capture = None
 
     print(SCREEN_TIPS_STARTUP_MESSAGE)
-    _configure_screen_dependency_logging()
+    print(SCREEN_TIPS_USAGE_INSTRUCTIONS)
+    previous_logging_level = _configure_screen_dependency_logging()
 
     try:
         capture = capture_factory()
@@ -968,5 +1088,8 @@ def run_screen_coding_tips(  # pylint: disable=too-many-arguments,too-many-local
             "installation."
         )
     finally:
-        if capture is not None:
-            _close_capture_backend(capture)
+        try:
+            if capture is not None:
+                _close_capture_backend(capture)
+        finally:
+            _restore_screen_dependency_logging(previous_logging_level)

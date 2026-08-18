@@ -25,6 +25,8 @@ from loguru import logger as dependency_logger
 from openai import OpenAI, OpenAIError
 from tqdm import tqdm
 
+from screen_coding_tips import run_screen_coding_tips
+
 ENV_FILE = Path(__file__).resolve().with_name(".env")
 load_dotenv(dotenv_path=ENV_FILE, override=False)
 
@@ -339,6 +341,30 @@ def _print_colored(message, color):
         print(f"{color}{message}{Style.RESET_ALL}")
     else:
         print(message)
+
+
+def handle_screen_coding_tips_option():
+    """Construct one safe OpenAI client and start the Option 3 session."""
+    if not os.environ.get("OPENAI_API_KEY"):
+        _print_colored(
+            "OpenAI API configuration is missing. Configure it before using "
+            "option 3.",
+            Fore.RED,
+        )
+        return False
+
+    try:
+        client = OpenAI()
+    except OpenAIError:
+        _print_colored(
+            "The OpenAI client could not be initialized. Check your API "
+            "settings.",
+            Fore.RED,
+        )
+        return False
+
+    run_screen_coding_tips(client)
+    return True
 
 
 def _progress_bar(steps=None, *, total=None, description, unit):
@@ -1269,7 +1295,7 @@ def main():
             if choice == "2":
                 handle_repository_option()
             elif choice == "3":
-                _print_colored("Not implemented yet", Fore.YELLOW)
+                handle_screen_coding_tips_option()
             else:
                 _print_colored("Please choose 1, 2, or 3.", Fore.YELLOW)
     except (KeyboardInterrupt, EOFError):

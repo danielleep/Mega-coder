@@ -10,9 +10,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import mega_coder
+import screen_coding_tips as screen_tips
 
 
 SUCCESS_CODE = "assert 2 + 3 == 5\nprint('success')\n"
@@ -944,14 +945,18 @@ class ConsolePresentationTests(unittest.TestCase):
                 mega_coder.report_execution_result(success)
                 mega_coder.report_execution_result(failure)
                 with patch("builtins.input", side_effect=["invalid", EOFError]):
-                    with patch("mega_coder.just_fix_windows_console"):
-                        mega_coder.main()
+                    with patch(
+                        "mega_coder.run_screen_coding_tips"
+                    ) as screen_session:
+                        with patch("mega_coder.just_fix_windows_console"):
+                            mega_coder.main()
 
         output = terminal.getvalue()
         self.assertIn(mega_coder.Fore.GREEN, output)
         self.assertIn(mega_coder.Fore.RED, output)
         self.assertIn(mega_coder.Fore.YELLOW, output)
         self.assertEqual(output.count(mega_coder.Style.RESET_ALL), 3)
+        screen_session.assert_not_called()
 
     def test_repair_progress_is_quiet_when_redirected(self):
         """Repair progress uses tqdm without polluting redirected output."""
@@ -1105,11 +1110,15 @@ class RepositoryIngestionTests(unittest.TestCase):
             ) as mocked_ingest:
                 with patch("mega_coder.os.environ.get", return_value=True):
                     with patch("mega_coder.OpenAI", return_value=client) as openai:
-                        with patch("mega_coder.just_fix_windows_console"):
-                            with redirect_stdout(StringIO()) as captured:
-                                mega_coder.main()
+                        with patch(
+                            "mega_coder.run_screen_coding_tips"
+                        ) as screen_session:
+                            with patch("mega_coder.just_fix_windows_console"):
+                                with redirect_stdout(StringIO()) as captured:
+                                    mega_coder.main()
 
         output = captured.getvalue()
+        screen_session.assert_not_called()
         mocked_ingest.assert_called_once_with(
             "https://github.com/owner/repository"
         )
@@ -1302,24 +1311,228 @@ class RepositoryIngestionTests(unittest.TestCase):
             with patch("mega_coder.develop_program") as develop:
                 with patch("mega_coder.ingest") as mocked_ingest:
                     with patch("mega_coder.OpenAI") as mocked_openai:
-                        with patch("mega_coder.just_fix_windows_console"):
-                            with redirect_stdout(StringIO()):
-                                mega_coder.main()
+                        with patch(
+                            "mega_coder.run_screen_coding_tips"
+                        ) as screen_session:
+                            with patch("mega_coder.just_fix_windows_console"):
+                                with redirect_stdout(StringIO()):
+                                    mega_coder.main()
 
         develop.assert_called_once_with()
         mocked_ingest.assert_not_called()
         mocked_openai.assert_not_called()
+        screen_session.assert_not_called()
 
-    def test_option_three_remains_not_implemented(self):
-        """Connecting option 2 does not change option 3's placeholder."""
+    def test_option_three_menu_starts_mocked_coordinator(self):
+        """Choice 3 constructs one client and delegates to the screen module."""
+        client = object()
+        startup_message = (
+            "Perfect. Show me your screen and I will be giving you tips on "
+            "how to improve the code I see"
+        )
+        usage_instructions = (
+            "For best results:\n"
+            "- Open your IDE full screen.\n"
+            "- Hide the sidebar.\n"
+            "- Run Mega Coder in the IDE terminal below the editor.\n"
+            "- Configure the capture region so it contains only the editor, "
+            "not the terminal."
+        )
+
+        def mocked_screen_session(_client):
+            print(startup_message)
+            print(usage_instructions)
+
         with patch("builtins.input", side_effect=["3", EOFError]):
             with patch("mega_coder.ingest") as mocked_ingest:
-                with patch("mega_coder.just_fix_windows_console"):
-                    with redirect_stdout(StringIO()) as captured:
-                        mega_coder.main()
+                with patch("mega_coder.os.environ.get", return_value=True):
+                    with patch("mega_coder.OpenAI", return_value=client) as openai:
+                        with patch(
+                            "mega_coder.run_screen_coding_tips",
+                            side_effect=mocked_screen_session,
+                        ) as screen_session:
+                            with patch("mega_coder.just_fix_windows_console"):
+                                with redirect_stdout(StringIO()) as captured:
+                                    mega_coder.main()
 
         mocked_ingest.assert_not_called()
-        self.assertIn("Not implemented yet", captured.getvalue().splitlines())
+        openai.assert_called_once_with()
+        screen_session.assert_called_once_with(client)
+        output = captured.getvalue()
+        self.assertEqual(output.count(startup_message), 1)
+        self.assertEqual(output.count(usage_instructions), 1)
+        self.assertNotIn("Not implemented yet", output)
+
+
+class ScreenCodingTipsMenuTests(unittest.TestCase):
+    """Verify Milestone 6 menu wiring without live external boundaries."""
+
+    STARTUP_MESSAGE = (
+        "Perfect. Show me your screen and I will be giving you tips on how to "
+        "improve the code I see"
+    )
+    SAFE_CODE = "def total(values):\n    return sum(values)"
+
+    def test_full_menu_path_preserves_private_option_three_request(  # pylint: disable=too-many-locals
+        self,
+    ):
+        """The real coordinator receives one mocked client with exact settings."""
+        target = {"top": 0, "left": 0, "width": 20, "height": 10}
+        capture = SimpleNamespace(primary_monitor=target, close=Mock())
+        ocr_engine = object()
+        ocr_lines = tuple(
+            screen_tips.OCRLine(line, 0.99, None)
+            for line in self.SAFE_CODE.splitlines()
+        )
+        frames = (object(), object())
+        now = [0.0]
+
+        def monotonic_clock():
+            return now[0]
+
+        def fake_sleep(seconds):
+            self.assertGreaterEqual(seconds, 0.0)
+            now[0] += seconds
+
+        configured_client = Mock()
+        configured_client.responses.create.return_value = SimpleNamespace(
+            output_text="Prefer a descriptive parameter name."
+        )
+        base_client = Mock()
+        base_client.with_options.return_value = configured_client
+        sleep = Mock(side_effect=fake_sleep)
+
+        with (
+            patch("builtins.input", side_effect=["3"]),
+            patch("mega_coder.os.environ.get", return_value=True),
+            patch("mega_coder.OpenAI", return_value=base_client) as openai,
+            patch("mega_coder.just_fix_windows_console"),
+            patch.object(
+                screen_tips,
+                "create_capture_backend",
+                return_value=capture,
+            ) as create_capture,
+            patch.object(
+                screen_tips,
+                "create_ocr_engine",
+                return_value=ocr_engine,
+            ) as create_ocr,
+            patch.object(
+                screen_tips,
+                "_capture_resolved_screen_frame",
+                side_effect=(frames[0], frames[1], KeyboardInterrupt),
+            ) as capture_frame,
+            patch.object(
+                screen_tips,
+                "extract_ocr_lines",
+                return_value=ocr_lines,
+            ) as run_ocr,
+            patch.object(screen_tips, "monotonic_time", side_effect=monotonic_clock),
+            patch.object(screen_tips, "sleep_for", sleep),
+            redirect_stdout(StringIO()) as captured,
+        ):
+            mega_coder.main()
+
+        output = captured.getvalue()
+        self.assertEqual(output.count(self.STARTUP_MESSAGE), 1)
+        self.assertEqual(
+            output.count(screen_tips.SCREEN_TIPS_USAGE_INSTRUCTIONS), 1
+        )
+        self.assertIn(
+            self.STARTUP_MESSAGE
+            + "\n"
+            + screen_tips.SCREEN_TIPS_USAGE_INSTRUCTIONS,
+            output,
+        )
+        self.assertIn(screen_tips.SCREEN_TIPS_OUTPUT_BOUNDARY, output)
+        self.assertIn("Coding tips:", output)
+        self.assertIn("Prefer a descriptive parameter name.", output)
+        self.assertIn(screen_tips.SCREEN_TIPS_OUTPUT_END, output)
+        self.assertIn("Goodbye.", output)
+        self.assertNotIn("Not implemented yet", output)
+        openai.assert_called_once_with()
+        create_capture.assert_called_once_with()
+        create_ocr.assert_called_once_with()
+        self.assertEqual(capture_frame.call_count, 3)
+        self.assertEqual(run_ocr.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [call(3.0)] * 2)
+        capture.close.assert_called_once_with()
+        base_client.with_options.assert_called_once_with(
+            timeout=screen_tips.SCREEN_TIPS_REQUEST_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
+        request = configured_client.responses.create.call_args.kwargs
+        self.assertEqual(request["model"], "gpt-5-nano")
+        self.assertEqual(request["instructions"], screen_tips.SCREEN_TIPS_INSTRUCTIONS)
+        self.assertEqual(request["service_tier"], "default")
+        self.assertIs(request["store"], False)
+        self.assertEqual(request["text"], {"verbosity": "low"})
+        self.assertNotIn("tools", request)
+        self.assertIn(self.SAFE_CODE, request["input"])
+
+    def test_missing_api_configuration_never_starts_screen_dependencies(self):
+        """Choice 3 reports missing configuration before client construction."""
+        with (
+            patch("builtins.input", side_effect=["3", EOFError]),
+            patch("mega_coder.os.environ.get", return_value=None),
+            patch("mega_coder.OpenAI") as openai,
+            patch("mega_coder.run_screen_coding_tips") as screen_session,
+            patch.object(screen_tips, "create_capture_backend") as create_capture,
+            patch.object(screen_tips, "create_ocr_engine") as create_ocr,
+            patch("mega_coder.just_fix_windows_console"),
+            redirect_stdout(StringIO()) as captured,
+        ):
+            mega_coder.main()
+
+        openai.assert_not_called()
+        screen_session.assert_not_called()
+        create_capture.assert_not_called()
+        create_ocr.assert_not_called()
+        output = captured.getvalue()
+        self.assertIn("OpenAI API configuration is missing.", output)
+        self.assertIn("Goodbye.", output)
+        self.assertNotIn("Not implemented yet", output)
+
+    def test_client_initialization_failure_is_safe(self):
+        """SDK construction details are not printed and capture never starts."""
+        private_detail = "private fake SDK initialization detail"
+        with (
+            patch("builtins.input", side_effect=["3", EOFError]),
+            patch("mega_coder.os.environ.get", return_value=True),
+            patch(
+                "mega_coder.OpenAI",
+                side_effect=mega_coder.OpenAIError(private_detail),
+            ),
+            patch("mega_coder.run_screen_coding_tips") as screen_session,
+            patch("mega_coder.just_fix_windows_console"),
+            redirect_stdout(StringIO()) as captured,
+        ):
+            mega_coder.main()
+
+        screen_session.assert_not_called()
+        output = captured.getvalue()
+        self.assertIn("OpenAI client could not be initialized", output)
+        self.assertNotIn(private_detail, output)
+        self.assertIn("Goodbye.", output)
+
+    def test_coordinator_interrupt_uses_existing_graceful_exit(self):
+        """Ctrl+C from the synchronous session reaches the menu-level handler."""
+        client = object()
+        with (
+            patch("builtins.input", return_value="3"),
+            patch("mega_coder.os.environ.get", return_value=True),
+            patch("mega_coder.OpenAI", return_value=client),
+            patch(
+                "mega_coder.run_screen_coding_tips",
+                side_effect=KeyboardInterrupt,
+            ) as screen_session,
+            patch("mega_coder.just_fix_windows_console"),
+            redirect_stdout(StringIO()) as captured,
+        ):
+            mega_coder.main()
+
+        screen_session.assert_called_once_with(client)
+        self.assertIn("Goodbye.", captured.getvalue())
 
 
 if __name__ == "__main__":

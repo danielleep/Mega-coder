@@ -5,6 +5,8 @@
 
 from importlib import import_module
 from importlib.util import find_spec
+from io import StringIO
+import logging
 from types import SimpleNamespace
 import unittest
 from unittest.mock import ANY, Mock, call, patch
@@ -98,6 +100,38 @@ def ocr_result(texts, scores, boxes):
 def recognized_line(text, confidence=0.99):
     """Create harmless synthetic OCR text for local candidate tests."""
     return screen_tips.OCRLine(text, confidence, None)
+
+
+def positioned_line(text, top, confidence=0.99):
+    """Create harmless OCR text at a deterministic vertical position."""
+    box = ((0, top), (200, top), (200, top + 10), (0, top + 10))
+    return screen_tips.OCRLine(text, confidence, box)
+
+
+def mixed_editor_terminal_lines(code, terminal_code):
+    """Place complete editor code above synthetic terminal output."""
+    editor_lines = tuple(
+        positioned_line(text, 20 + index * 20)
+        for index, text in enumerate(code.splitlines())
+        if text
+    )
+    return (
+        positioned_line("Explorer", 0),
+        *editor_lines,
+        positioned_line(screen_tips.SCREEN_TIPS_OUTPUT_BOUNDARY, 200),
+        positioned_line("Coding tips:", 220),
+        positioned_line(terminal_code, 240),
+        positioned_line(screen_tips.SCREEN_TIPS_OUTPUT_END, 260),
+    )
+
+
+def as_rapidocr_result(lines):
+    """Convert synthetic OCR lines into one mocked RapidOCR result."""
+    return ocr_result(
+        tuple(line.text for line in lines),
+        tuple(line.confidence for line in lines),
+        tuple(line.position for line in lines),
+    )
 
 
 def fake_screen_tips_client(output_text="Use a clearer function name."):
@@ -536,6 +570,59 @@ class CodeCandidateTests(unittest.TestCase):
             screen_tips.extract_code_candidate(lines),
             "def add(left, right):\n    return left + right",
         )
+
+    def test_terminal_boundary_uses_geometry_and_flexible_punctuation(self):
+        """Editor code survives while all lower terminal text is removed."""
+        editor_code = "def add(left, right):\n    return left + right"
+        ordered_lines = mixed_editor_terminal_lines(
+            editor_code, "def printed_tip_code(): return 'ignore me'"
+        )
+        boundary_index = next(
+            index
+            for index, line in enumerate(ordered_lines)
+            if line.text == screen_tips.SCREEN_TIPS_OUTPUT_BOUNDARY
+        )
+        flexible_boundary = screen_tips.OCRLine(
+            "... MEGA CODER TIPS BELOW !!!",
+            ordered_lines[boundary_index].confidence,
+            ordered_lines[boundary_index].position,
+        )
+        lines = (
+            flexible_boundary,
+            *ordered_lines[:boundary_index],
+            *ordered_lines[boundary_index + 1:],
+        )
+
+        candidate = screen_tips.extract_code_candidate(lines)
+
+        self.assertEqual(candidate, editor_code)
+        self.assertNotIn("printed_tip_code", candidate)
+        self.assertNotIn("Coding tips", candidate)
+        self.assertNotIn("TIPS BELOW", candidate)
+        self.assertEqual(
+            screen_tips.SCREEN_TIPS_OUTPUT_BOUNDARY,
+            "---------------- MEGA CODER TIPS BELOW ----------------",
+        )
+
+    def test_nearby_trailing_prints_survive_one_blank_line(self):
+        """One blank-line-sized gap keeps both trailing print calls in order."""
+        code = (
+            "def calculate_total(prices):\n"
+            "    return sum(prices)\n\n"
+            "print(calculate_total([10, 20, 30]))\n"
+            'print("hello world")'
+        )
+        lines = tuple(
+            positioned_line(text, top)
+            for text, top in (
+                ("def calculate_total(prices):", 20),
+                ("    return sum(prices)", 40),
+                ("print(calculate_total([10, 20, 30]))", 80),
+                ('print("hello world")', 100),
+            )
+        )
+
+        self.assertEqual(screen_tips.extract_code_candidate(lines), code)
 
     def test_normalization_changes_only_the_permitted_whitespace(self):
         """Case, indentation, internal spacing, and meaningful text survive."""
@@ -985,6 +1072,12 @@ class ScreenCodingTipsSessionTests(  # pylint: disable=protected-access
 
     CODE_A = "def total(values):\n    return sum(values)"
     CODE_B = "def total(values):\n    return sum(values) + 1"
+    CALCULATOR_A = (
+        "def calculate_total(prices):\n"
+        "    return sum(prices)\n\n"
+        "print(calculate_total([10, 20, 30]))"
+    )
+    CALCULATOR_B = CALCULATOR_A + '\nprint("hello world")'
     CODE_A_LINES = tuple(recognized_line(line) for line in CODE_A.splitlines())
     CODE_B_LINES = tuple(recognized_line(line) for line in CODE_B.splitlines())
 
@@ -1037,8 +1130,27 @@ class ScreenCodingTipsSessionTests(  # pylint: disable=protected-access
             ),
             1,
         )
+        self.assertEqual(
+            output.call_args_list[:2],
+            [
+                call(
+                    "Perfect. Show me your screen and I will be giving you "
+                    "tips on how to improve the code I see"
+                ),
+                call(
+                    "For best results:\n"
+                    "- Open your IDE full screen.\n"
+                    "- Hide the sidebar.\n"
+                    "- Run Mega Coder in the IDE terminal below the editor.\n"
+                    "- Configure the capture region so it contains only the "
+                    "editor, not the terminal."
+                ),
+            ],
+        )
+        output.assert_any_call(screen_tips.SCREEN_TIPS_OUTPUT_BOUNDARY)
         output.assert_any_call("Coding tips:")
         output.assert_any_call("Use a clearer function name.")
+        output.assert_any_call(screen_tips.SCREEN_TIPS_OUTPUT_END)
         capture_factory.assert_called_once_with()
         ocr_factory.assert_called_once_with()
         resolve_target.assert_called_once_with(
@@ -1066,6 +1178,128 @@ class ScreenCodingTipsSessionTests(  # pylint: disable=protected-access
         self.assertIs(request["store"], False)
         self.assertEqual(request["text"], {"verbosity": "low"})
         self.assertNotIn("tools", request)
+
+    def test_configured_editor_region_filters_terminal_and_tracks_code_changes(  # pylint: disable=too-many-locals
+        self,
+    ):
+        """The real local pipeline keeps small editor additions and ignores tips."""
+        capture = session_capture()
+        capture.grab.return_value = object()
+        clock = FakeClock()
+        frame = object()
+        code_a_fixtures = tuple(
+            mixed_editor_terminal_lines(
+                self.CALCULATOR_A,
+                f"def printed_tip_{number}(): return {number}",
+            )
+            for number in range(1, 5)
+        )
+        code_b_fixtures = tuple(
+            mixed_editor_terminal_lines(
+                self.CALCULATOR_B,
+                f"def newer_terminal_{number}(): return {number}",
+            )
+            for number in range(5, 8)
+        )
+        code_a_results = tuple(map(as_rapidocr_result, code_a_fixtures))
+        code_b_results = tuple(map(as_rapidocr_result, code_b_fixtures))
+
+        adapted_a = screen_tips.extract_ocr_lines(
+            frame, Mock(return_value=code_a_results[0])
+        )
+        adapted_b = screen_tips.extract_ocr_lines(
+            frame, Mock(return_value=code_b_results[0])
+        )
+        candidate_a = screen_tips.extract_code_candidate(adapted_a)
+        candidate_b = screen_tips.extract_code_candidate(adapted_b)
+        normalized_a = screen_tips.normalize_code_candidate(candidate_a)
+        normalized_b = screen_tips.normalize_code_candidate(candidate_b)
+
+        self.assertEqual(
+            tuple(line.text for line in adapted_b), code_b_results[0].txts
+        )
+        vertical_positions = [
+            min(point[1] for point in line.position) for line in adapted_b
+        ]
+        self.assertEqual(vertical_positions, sorted(vertical_positions))
+        for source_line in self.CALCULATOR_B.splitlines():
+            if source_line:
+                self.assertIn(source_line, code_b_results[0].txts)
+        self.assertEqual(candidate_a, self.CALCULATOR_A)
+        self.assertEqual(candidate_b, self.CALCULATOR_B)
+        self.assertNotEqual(normalized_a, normalized_b)
+        self.assertIn("print(calculate_total", candidate_a)
+        self.assertIn('print("hello world")', candidate_b)
+
+        ocr_engine = Mock(side_effect=code_a_results + code_b_results)
+        base_client, configured_client = fake_screen_tips_client()
+        configured_client.responses.create.side_effect = (
+            SimpleNamespace(output_text="Tip for candidate A."),
+            SimpleNamespace(output_text="Tip for candidate B."),
+        )
+
+        with (
+            patch.object(screen_tips, "SCREEN_CAPTURE_REGION", EDITOR_REGION),
+            patch.object(screen_tips, "SCREEN_MONITOR_INDEX", 2),
+            patch.object(
+                screen_tips,
+                "_convert_bgra_screenshot",
+                return_value=frame,
+            ) as convert_frame,
+            patch("builtins.print") as output,
+        ):
+            screen_tips.run_screen_coding_tips(
+                base_client,
+                capture_factory=Mock(return_value=capture),
+                ocr_engine_factory=Mock(return_value=ocr_engine),
+                monotonic_clock=clock.monotonic,
+                sleep_function=clock.sleep,
+                max_iterations=7,
+            )
+
+        self.assertEqual(
+            capture.grab.call_args_list,
+            [call(EDITOR_REGION)] * 7,
+        )
+        self.assertEqual(convert_frame.call_count, 7)
+        self.assertEqual(ocr_engine.call_count, 7)
+        self.assertEqual(configured_client.responses.create.call_count, 2)
+        request_inputs = [
+            request.kwargs["input"]
+            for request in configured_client.responses.create.call_args_list
+        ]
+        self.assertIn(self.CALCULATOR_A, request_inputs[0])
+        self.assertNotIn("hello world", request_inputs[0])
+        self.assertIn(self.CALCULATOR_B, request_inputs[1])
+        self.assertNotIn("printed_tip_", "".join(request_inputs))
+        self.assertNotIn("newer_terminal_", "".join(request_inputs))
+        self.assertEqual(
+            output.call_args_list.count(
+                call(screen_tips.SCREEN_TIPS_OUTPUT_BOUNDARY)
+            ),
+            2,
+        )
+        self.assertEqual(
+            output.call_args_list.count(call(screen_tips.SCREEN_TIPS_OUTPUT_END)),
+            2,
+        )
+        output.assert_has_calls(
+            [
+                call(screen_tips.SCREEN_TIPS_OUTPUT_BOUNDARY),
+                call("Coding tips:"),
+                call("Tip for candidate A."),
+                call(screen_tips.SCREEN_TIPS_OUTPUT_END),
+            ]
+        )
+        output.assert_has_calls(
+            [
+                call(screen_tips.SCREEN_TIPS_OUTPUT_BOUNDARY),
+                call("Coding tips:"),
+                call("Tip for candidate B."),
+                call(screen_tips.SCREEN_TIPS_OUTPUT_END),
+            ]
+        )
+        capture.close.assert_called_once_with()
 
     def test_default_target_is_the_mocked_primary_monitor(self):
         """The no-setting path keeps the documented first-monitor fallback."""
@@ -1495,23 +1729,93 @@ class ScreenCodingTipsSessionTests(  # pylint: disable=protected-access
         request_tips.assert_not_called()
         capture.close.assert_called_once_with()
 
-    def test_session_dependency_loggers_keep_warnings_and_errors(self):
-        """Only routine INFO output is suppressed for screen dependencies."""
-        loggers = {
-            name: Mock() for name in screen_tips._SCREEN_DEPENDENCY_LOGGERS
-        }
-        with patch.object(
-            screen_tips.logging,
-            "getLogger",
-            side_effect=lambda name: loggers[name],
-        ) as get_logger:
-            screen_tips._configure_screen_dependency_logging()
+    def test_session_suppresses_info_logs_and_restores_logging(self):
+        """Option 3 hides dependency INFO only while its session is active."""
+        logger_names = (
+            "RapidOCR",
+            "openvino.runtime",
+            "openai._base_client",
+            "httpx",
+        )
+        dependency_loggers = [logging.getLogger(name) for name in logger_names]
+        original_logger_state = [
+            (logger.level, logger.propagate) for logger in dependency_loggers
+        ]
+        original_disable_level = logging.root.manager.disable
+        log_stream = StringIO()
+        handler = logging.StreamHandler(log_stream)
+        capture = session_capture()
+        clock = FakeClock()
 
-        self.assertEqual(get_logger.call_count, len(loggers))
-        for dependency_logger in loggers.values():
-            dependency_logger.setLevel.assert_called_once_with(
-                screen_tips.logging.WARNING
+        def initialize_ocr():
+            logging.getLogger("RapidOCR").info("hidden RapidOCR initialization")
+            logging.getLogger("openvino.runtime").info(
+                "hidden OpenVINO initialization"
             )
+            logging.getLogger("RapidOCR").warning("visible OCR warning")
+            return object()
+
+        def request_tips(_client, _candidate):
+            logging.getLogger("openai._base_client").info(
+                "hidden OpenAI HTTP request"
+            )
+            logging.getLogger("httpx").info("hidden httpx request")
+            logging.getLogger("httpx").error("visible HTTP error")
+            return screen_tips.ScreenTipsResult(True, "Visible coding tip.", "")
+
+        try:
+            logging.disable(logging.NOTSET)
+            for dependency_logger in dependency_loggers:
+                dependency_logger.setLevel(logging.INFO)
+                dependency_logger.propagate = False
+                dependency_logger.addHandler(handler)
+
+            with (
+                patch.object(
+                    screen_tips,
+                    "_capture_resolved_screen_frame",
+                    return_value=object(),
+                ),
+                patch.object(
+                    screen_tips,
+                    "extract_ocr_lines",
+                    return_value=self.CODE_A_LINES,
+                ),
+                patch.object(
+                    screen_tips,
+                    "request_screen_tips",
+                    side_effect=request_tips,
+                ),
+                patch("builtins.print") as output,
+            ):
+                screen_tips.run_screen_coding_tips(
+                    Mock(),
+                    capture_factory=Mock(return_value=capture),
+                    ocr_engine_factory=initialize_ocr,
+                    monotonic_clock=clock.monotonic,
+                    sleep_function=clock.sleep,
+                    max_iterations=2,
+                )
+
+            logging.getLogger("RapidOCR").info("visible after session")
+            logged = log_stream.getvalue()
+            self.assertNotIn("hidden RapidOCR initialization", logged)
+            self.assertNotIn("hidden OpenVINO initialization", logged)
+            self.assertNotIn("hidden OpenAI HTTP request", logged)
+            self.assertNotIn("hidden httpx request", logged)
+            self.assertIn("visible OCR warning", logged)
+            self.assertIn("visible HTTP error", logged)
+            self.assertIn("visible after session", logged)
+            output.assert_any_call("Visible coding tip.")
+            self.assertEqual(logging.root.manager.disable, logging.NOTSET)
+        finally:
+            logging.disable(original_disable_level)
+            for dependency_logger, state in zip(
+                dependency_loggers, original_logger_state
+            ):
+                dependency_logger.removeHandler(handler)
+                dependency_logger.setLevel(state[0])
+                dependency_logger.propagate = state[1]
 
 
 if __name__ == "__main__":
